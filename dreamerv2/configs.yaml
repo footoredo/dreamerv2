@@ -156,3 +156,9 @@ debug:
   train_steps: 1
   replay: { minlen: 10, maxlen: 30 }
   dataset: { batch: 10, length: 10 }
+
+
+replay:
+
+  steps: 1800
+  dataset: { batch: 6, length: 300 }

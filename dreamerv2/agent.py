@@ -72,7 +72,7 @@ class Agent(common.Module):
         return state, metrics
 
     @tf.function
-    def report(self, data):
+    def report(self, data, save_path=None):
         report = {}
         data = self.wm.preprocess(data)
         for key in data:
@@ -80,6 +80,17 @@ class Agent(common.Module):
                 name = key.replace('/', '_')
                 images, rewards, actions = self.wm.video_pred(data, key)
                 report[f'openl_{name}'] = images
+                if save_path:
+                    truth_rewards, model_rewards = rewards
+                    import joblib
+                    joblib.dump({
+                        "images": images, 
+                        "rewards": {
+                            "truth": truth_rewards,
+                            "model": model_rewards
+                        },
+                        "actions": actions
+                    }, save_path)
                 
         return report
 

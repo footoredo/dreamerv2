@@ -136,3 +136,55 @@ def train(env, config, outputs=None):
         logger.write()
         driver(policy, steps=config.eval_every)
         agnt.save(logdir / 'variables.pkl')
+
+
+def replay(env, config, outputs=None):
+    logdir = pathlib.Path(config.logdir).expanduser()
+    logdir.mkdir(parents=True, exist_ok=True)
+    config.save(logdir / 'config.yaml')
+    print(config, '\n')
+    print('Logdir', logdir)
+
+    tf.config.experimental_run_functions_eagerly(not config.jit)
+    message = 'No GPU found. To actually train on CPU remove this assert.'
+    assert tf.config.experimental.list_physical_devices('GPU'), message
+    for gpu in tf.config.experimental.list_physical_devices('GPU'):
+        tf.config.experimental.set_memory_growth(gpu, True)
+    assert config.precision in (16, 32), config.precision
+    if config.precision == 16:
+        from tensorflow.keras.mixed_precision import experimental as prec
+        prec.set_policy(prec.Policy('mixed_float16'))
+
+    outputs = outputs or [
+        common.TerminalOutput()
+    ]
+    replay = common.Replay(logdir / 'train_episodes', **config.replay)
+    step = common.Counter(replay.stats['total_steps'])
+    logger = common.Logger(step, outputs, multiplier=config.action_repeat)
+
+    print('Create envs.')
+    act_space = env.act_space['action']
+    num_actions = act_space.n if config.discrete else act_space.shape[-1]
+    driver = common.Driver([env])
+    driver.on_step(lambda tran, worker: step.increment())
+    driver.on_step(replay.add_step)
+    driver.on_reset(replay.add_step)
+
+    print('Create agent.')
+    dataset = iter(replay.dataset(**config.dataset))
+    shapes = {k: v.shape[2:] for k, v in dataset.element_spec.items()}
+    agnt = agent.Agent(config, logger, step, shapes)
+    train_agent = common.CarryOverState(agnt.train)
+    train_agent(next(dataset))
+    if (logdir / 'variables.pkl').exists():
+        agnt.load(logdir / 'variables.pkl')
+    else:
+        print('Pretrain agent.')
+        for _ in range(config.pretrain):
+            train_agent(next(dataset))
+    policy = lambda *args: agnt.policy(
+        *args, mode='train')
+
+    while step < config.steps:
+        driver(policy, steps=config.steps)
+        agnt.report(next(dataset), logdir / 'replay.data')
