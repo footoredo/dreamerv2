@@ -151,7 +151,7 @@ debug:
   time_limit: 100
   eval_every: 300
   log_every: 300
-  prefill: 100
+  prefill: 500
   pretrain: 1
   train_steps: 1
   replay: { minlen: 10, maxlen: 30 }

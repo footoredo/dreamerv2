@@ -78,7 +78,9 @@ class Agent(common.Module):
         for key in data:
             if re.match(self.config.decoder.cnn_keys, key):
                 name = key.replace('/', '_')
-                report[f'openl_{name}'] = self.wm.video_pred(data, key)
+                images, rewards, actions = self.wm.video_pred(data, key)
+                report[f'openl_{name}'] = images
+                
         return report
 
 
@@ -141,6 +143,8 @@ class WorldModel(common.Module):
         start = {k: flatten(v) for k, v in start.items()}
         start['feat'] = self.rssm.get_feat(start)
         start['action'] = tf.zeros_like(policy(start['feat']).mode())
+        # print("in imagine:", start.keys())  # dict_keys(['logit', 'stoch', 'deter', 'feat', 'action'])
+        # print("in imagine:", start.items())
         seq = {k: [v] for k, v in start.items()}
         for _ in range(horizon):
             action = policy(tf.stop_gradient(seq['feat'][-1])).sample()
@@ -195,14 +199,19 @@ class WorldModel(common.Module):
         states, _ = self.rssm.observe(
             embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5])
         recon = decoder(self.rssm.get_feat(states))[key].mode()[:6]
+        recon_reward = self.heads['reward'](self.rssm.get_feat(states)).mode()[:6]
         init = {k: v[:, -1] for k, v in states.items()}
         prior = self.rssm.imagine(data['action'][:6, 5:], init)
         openl = decoder(self.rssm.get_feat(prior))[key].mode()
+        openl_reward = self.heads['reward'](self.rssm.get_feat(prior)).mode()[:6]
+        truth_reward = data['reward'][:6]
+        model_reward = tf.concat([recon_reward, openl_reward], 1)
         model = tf.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
         error = (model - truth + 1) / 2
         video = tf.concat([truth, model, error], 2)
         B, T, H, W, C = video.shape
-        return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
+        actions = data['action'][:6]
+        return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C)), {"truth": truth_reward, "mode": model_reward}, actions
 
 
 class ActorCritic(common.Module):
