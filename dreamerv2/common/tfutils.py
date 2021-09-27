@@ -46,11 +46,12 @@ class Module(tf.Module):
             pickle.dump(values, f)
 
     def load(self, filename):
+        print(f"in load({filename})", flush=True)
         with pathlib.Path(filename).open('rb') as f:
             values = pickle.load(f)
         amount = len(tf.nest.flatten(values))
         count = int(sum(np.prod(x.shape) for x in tf.nest.flatten(values)))
-        print(f'Load checkpoint with {amount} tensors and {count} parameters.')
+        print(f'Load checkpoint with {amount} tensors and {count} parameters.', flush=True)
         tf.nest.map_structure(lambda x, y: x.assign(y), self.variables, values)
 
     def get(self, name, ctor, *args, **kwargs):

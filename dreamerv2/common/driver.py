@@ -29,6 +29,7 @@ class Driver:
     def __call__(self, policy, steps=0, episodes=0):
         step, episode = 0, 0
         while step < steps or episode < episodes:
+            print(f"Driver progress: step {step}, episode {episode}", flush=True)
             obs = {
                 i: self._envs[i].reset()
                 for i, ob in enumerate(self._obs) if ob is None or ob['is_last']}

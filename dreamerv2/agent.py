@@ -17,6 +17,8 @@ class Agent(common.Module):
         self._counter = step
         self.step = tf.Variable(int(self._counter), tf.int64)
         self.wm = WorldModel(self.step, shapes, config)
+
+        # print("wm:", self.wm.variables)
         self._task_behavior = ActorCritic(config, self.step, self._num_act)
         if config.expl_behavior == 'greedy':
             self._expl_behavior = self._task_behavior
@@ -59,6 +61,7 @@ class Agent(common.Module):
 
     @tf.function
     def train(self, data, state=None):
+        print("in agent train()", flush=True)
         metrics = {}
         state, outputs, mets = self.wm.train(data, state)
         metrics.update(mets)
@@ -69,10 +72,12 @@ class Agent(common.Module):
         if self.config.expl_behavior != 'greedy':
             mets = self._expl_behavior.train(start, outputs, data)[-1]
             metrics.update({'expl_' + key: value for key, value in mets.items()})
+        print("out agent train()", flush=True)
         return state, metrics
 
     @tf.function
     def report(self, data, save_path=None):
+        print(f"in report(), save_path={save_path}")
         report = {}
         data = self.wm.preprocess(data)
         for key in data:
@@ -81,6 +86,7 @@ class Agent(common.Module):
                 images, rewards, actions = self.wm.video_pred(data, key)
                 report[f'openl_{name}'] = images
                 if save_path:
+                    print("save pred data")
                     truth_rewards, model_rewards = rewards
                     import joblib
                     joblib.dump({
@@ -105,6 +111,7 @@ class WorldModel(common.Module):
         self.heads = {}
         self.heads['decoder'] = common.Decoder(shapes, **config.decoder)
         self.heads['reward'] = common.MLP([], **config.reward_head)
+        print("wm.reward:", self.heads['reward'].variables)
         if config.pred_discount:
             self.heads['discount'] = common.MLP([], **config.discount_head)
         for name in config.grad_heads:
@@ -112,10 +119,12 @@ class WorldModel(common.Module):
         self.model_opt = common.Optimizer('model', **config.model_opt)
 
     def train(self, data, state=None):
+        print("in wm train()", flush=True)
         with tf.GradientTape() as model_tape:
             model_loss, state, outputs, metrics = self.loss(data, state)
         modules = [self.encoder, self.rssm, *self.heads.values()]
         metrics.update(self.model_opt(model_tape, model_loss, modules))
+        print("out wm train()", flush=True)
         return state, outputs, metrics
 
     def loss(self, data, state=None):
@@ -243,6 +252,7 @@ class ActorCritic(common.Module):
         self.rewnorm = common.StreamNorm(**self.config.reward_norm)
 
     def train(self, world_model, start, is_terminal, reward_fn):
+        print("in policy train()", flush=True)
         metrics = {}
         hor = self.config.imag_horizon
         # The weights are is_terminal flags for the imagination start states.
@@ -263,6 +273,7 @@ class ActorCritic(common.Module):
         metrics.update(self.critic_opt(critic_tape, critic_loss, self.critic))
         metrics.update(**mets1, **mets2, **mets3, **mets4)
         self.update_slow_target()  # Variables exist after first forward pass.
+        print("out policy train()", flush=True)
         return metrics
 
     def actor_loss(self, seq, target):
