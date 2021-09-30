@@ -103,12 +103,12 @@ def train(env, config, outputs=None):
         driver(random_agent, steps=prefill, episodes=1)
         driver.reset()
 
-    print('Create agent.')
+    print('Create agent.', flush=True)
     dataset = iter(replay.dataset(**config.dataset))
     shapes = {k: v.shape[2:] for k, v in dataset.element_spec.items()}
     agnt = agent.Agent(config, logger, step, shapes)
     train_agent = common.CarryOverState(agnt.train)
-    train_agent(next(dataset))
+    train_agent(next(dataset))  
     if (logdir / 'variables.pkl').exists():
         agnt.load(logdir / 'variables.pkl')
     else:
@@ -172,7 +172,7 @@ def replay(env, config, outputs=None):
     driver.on_reset(replay.add_step)
 
     random_agent = common.RandomAgent(num_actions, config.discrete)
-    driver(random_agent, steps=2100, episodes=1)
+    driver(random_agent, steps=1000, episodes=1)
     print('Prefill end', flush=True)
     driver.reset()
 

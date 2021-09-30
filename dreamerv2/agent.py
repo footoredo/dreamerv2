@@ -61,7 +61,7 @@ class Agent(common.Module):
 
     @tf.function
     def train(self, data, state=None):
-        print("in agent train()", flush=True)
+        # print("in agent train()", flush=True)
         metrics = {}
         state, outputs, mets = self.wm.train(data, state)
         metrics.update(mets)
@@ -72,7 +72,7 @@ class Agent(common.Module):
         if self.config.expl_behavior != 'greedy':
             mets = self._expl_behavior.train(start, outputs, data)[-1]
             metrics.update({'expl_' + key: value for key, value in mets.items()})
-        print("out agent train()", flush=True)
+        # print("out agent train()", flush=True)
         return state, metrics
 
     @tf.function
@@ -119,12 +119,12 @@ class WorldModel(common.Module):
         self.model_opt = common.Optimizer('model', **config.model_opt)
 
     def train(self, data, state=None):
-        print("in wm train()", flush=True)
+        # print("in wm train()", flush=True)
         with tf.GradientTape() as model_tape:
             model_loss, state, outputs, metrics = self.loss(data, state)
         modules = [self.encoder, self.rssm, *self.heads.values()]
         metrics.update(self.model_opt(model_tape, model_loss, modules))
-        print("out wm train()", flush=True)
+        # print("out wm train()", flush=True)
         return state, outputs, metrics
 
     def loss(self, data, state=None):
@@ -213,20 +213,21 @@ class WorldModel(common.Module):
 
     @tf.function
     def video_pred(self, data, key):
+        bootstrap_frames = 20
         decoder = self.heads['decoder']
         truth = data[key][:6] + 0.5
         embed = self.encoder(data)
         states, _ = self.rssm.observe(
-            embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5])
+            embed[:6, :bootstrap_frames], data['action'][:6, :bootstrap_frames], data['is_first'][:6, :bootstrap_frames])
         recon = decoder(self.rssm.get_feat(states))[key].mode()[:6]
         recon_reward = self.heads['reward'](self.rssm.get_feat(states)).mode()[:6]
         init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.rssm.imagine(data['action'][:6, 5:], init)
+        prior = self.rssm.imagine(data['action'][:6, bootstrap_frames:], init)
         openl = decoder(self.rssm.get_feat(prior))[key].mode()
         openl_reward = self.heads['reward'](self.rssm.get_feat(prior)).mode()[:6]
         truth_reward = data['reward'][:6]
         model_reward = tf.concat([recon_reward, openl_reward], 1)
-        model = tf.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
+        model = tf.concat([recon[:, :bootstrap_frames] + 0.5, openl + 0.5], 1)
         error = (model - truth + 1) / 2
         video = tf.concat([truth, model, error], 2)
         B, T, H, W, C = video.shape
@@ -252,7 +253,7 @@ class ActorCritic(common.Module):
         self.rewnorm = common.StreamNorm(**self.config.reward_norm)
 
     def train(self, world_model, start, is_terminal, reward_fn):
-        print("in policy train()", flush=True)
+        # print("in policy train()", flush=True)
         metrics = {}
         hor = self.config.imag_horizon
         # The weights are is_terminal flags for the imagination start states.
@@ -273,7 +274,7 @@ class ActorCritic(common.Module):
         metrics.update(self.critic_opt(critic_tape, critic_loss, self.critic))
         metrics.update(**mets1, **mets2, **mets3, **mets4)
         self.update_slow_target()  # Variables exist after first forward pass.
-        print("out policy train()", flush=True)
+        # print("out policy train()", flush=True)
         return metrics
 
     def actor_loss(self, seq, target):
