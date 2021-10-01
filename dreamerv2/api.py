@@ -146,7 +146,7 @@ def replay(env, config, outputs=None):
     print('Logdir', logdir)
     print("Replay...")
 
-    tf.config.experimental_run_functions_eagerly(not config.jit)
+    # tf.config.experimental_run_functions_eagerly(not config.jit)
     message = 'No GPU found. To actually train on CPU remove this assert.'
     assert tf.config.experimental.list_physical_devices('GPU'), message
     for gpu in tf.config.experimental.list_physical_devices('GPU'):
@@ -155,6 +155,8 @@ def replay(env, config, outputs=None):
     if config.precision == 16:
         from tensorflow.keras.mixed_precision import experimental as prec
         prec.set_policy(prec.Policy('mixed_float16'))
+    
+    tf.config.run_functions_eagerly(True)
 
     outputs = outputs or [
         common.TerminalOutput()
@@ -173,24 +175,16 @@ def replay(env, config, outputs=None):
 
     random_agent = common.RandomAgent(num_actions, config.discrete)
     driver(random_agent, steps=1000, episodes=1)
-    print('Prefill end', flush=True)
+    # print('Prefill end', flush=True)
     driver.reset()
 
-    print('Create agent.', flush=True)
+    # print('Create agent.', flush=True)
     dataset = iter(replay.dataset(**config.dataset))
     shapes = {k: v.shape[2:] for k, v in dataset.element_spec.items()}
     agnt = agent.Agent(config, logger, step, shapes)
-    print('before init train', flush=True)
+    # print('before init train', flush=True)
     agnt.train(next(dataset))
-    print('before load', flush=True)
-    print('before load', flush=True)
-    print('before load', flush=True)
-    print('before load', flush=True)
-    print('before load', flush=True)
-
-    print('before load', flush=True)
     agnt.load(logdir / 'variables.pkl')
-    print('after load', flush=True)
     # train_agent = common.CarryOverState(agnt.train)
     # train_agent(next(dataset))
     # print("Before load")
@@ -208,7 +202,6 @@ def replay(env, config, outputs=None):
     policy = lambda *args: agnt.policy(
         *args, mode='train')
 
-    print("step", step, config.steps, flush=True)
     while step < config.steps:
         driver(policy, steps=config.steps)
         # dataset = iter(replay.dataset(**config.dataset))

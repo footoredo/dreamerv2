@@ -86,16 +86,15 @@ class Agent(common.Module):
                 images, rewards, actions = self.wm.video_pred(data, key)
                 report[f'openl_{name}'] = images
                 if save_path:
-                    print("save pred data")
-                    truth_rewards, model_rewards = rewards
+                    # print("save pred data")
                     import joblib
                     joblib.dump({
-                        "images": images, 
+                        "images": images.numpy(), 
                         "rewards": {
-                            "truth": truth_rewards,
-                            "model": model_rewards
+                            "truth": rewards["truth"].numpy(),
+                            "model": rewards["model"].numpy()
                         },
-                        "actions": actions
+                        "actions": actions.numpy()
                     }, save_path)
                 
         return report
@@ -232,7 +231,7 @@ class WorldModel(common.Module):
         video = tf.concat([truth, model, error], 2)
         B, T, H, W, C = video.shape
         actions = data['action'][:6]
-        return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C)), {"truth": truth_reward, "mode": model_reward}, actions
+        return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C)), {"truth": truth_reward, "model": model_reward}, actions
 
 
 class ActorCritic(common.Module):
