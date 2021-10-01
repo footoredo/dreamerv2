@@ -158,49 +158,45 @@ def replay(env, config, outputs=None):
     
     tf.config.run_functions_eagerly(True)
 
+    prefill_steps = 100
+
     outputs = outputs or [
         common.TerminalOutput()
     ]
-    replay = common.Replay(logdir / 'train_episodes', **config.replay)
-    step = common.Counter(replay.stats['total_steps'])
-    logger = common.Logger(step, outputs, multiplier=config.action_repeat)
+    prefill_replay = common.Replay(logdir / 'prefill_episodes', **config.replay)
+    prefill_step = common.Counter(prefill_steps)
 
     print('Create envs.')
     act_space = env.act_space['action']
     num_actions = act_space.n if config.discrete else act_space.shape[-1]
+    prefill_driver = common.Driver([env])
+    prefill_driver.on_step(lambda tran, worker: prefill_step.increment())
+    prefill_driver.on_step(prefill_replay.add_step)
+    prefill_driver.on_reset(prefill_replay.add_step)
+
+    random_agent = common.RandomAgent(num_actions, config.discrete)
+    prefill_driver(random_agent, steps=prefill_steps, episodes=1)
+
+    replay = common.Replay(logdir / 'train_episodes', **config.replay)
+    step = common.Counter(replay.stats['total_steps'])
+    logger = common.Logger(step, outputs, multiplier=config.action_repeat)
+
+    # print('Create agent.', flush=True)
+    prefill_dataset = iter(prefill_replay.dataset(**config.dataset))
+    shapes = {k: v.shape[2:] for k, v in prefill_dataset.element_spec.items()}
+    agnt = agent.Agent(config, logger, step, shapes)
+    # print('before init train', flush=True)
+    agnt.train(next(prefill_dataset))
+    agnt.load(logdir / 'variables.pkl')
+
+    policy = lambda *args: agnt.policy(
+        *args, mode='train')
+
     driver = common.Driver([env])
     driver.on_step(lambda tran, worker: step.increment())
     driver.on_step(replay.add_step)
     driver.on_reset(replay.add_step)
-
-    random_agent = common.RandomAgent(num_actions, config.discrete)
-    driver(random_agent, steps=1000, episodes=1)
-    # print('Prefill end', flush=True)
-    driver.reset()
-
-    # print('Create agent.', flush=True)
     dataset = iter(replay.dataset(**config.dataset))
-    shapes = {k: v.shape[2:] for k, v in dataset.element_spec.items()}
-    agnt = agent.Agent(config, logger, step, shapes)
-    # print('before init train', flush=True)
-    agnt.train(next(dataset))
-    agnt.load(logdir / 'variables.pkl')
-    # train_agent = common.CarryOverState(agnt.train)
-    # train_agent(next(dataset))
-    # print("Before load")
-    # for variable in agnt.variables:
-    #     print(variable)
-    # for variable in agnt.variables:
-    #     print(variable.name)
-    # print("After load")
-    # if (logdir / 'variables.pkl').exists():
-    #     agnt.load(logdir / 'variables.pkl')
-    # else:
-    #     print('Pretrain agent.')
-    #     for _ in range(config.pretrain):
-    #         train_agent(next(dataset))
-    policy = lambda *args: agnt.policy(
-        *args, mode='train')
 
     while step < config.steps:
         driver(policy, steps=config.steps)
