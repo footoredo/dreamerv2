@@ -59,7 +59,9 @@ class Module(tf.Module):
         if not hasattr(self, '_modules'):
             self._modules = {}
         if name not in self._modules:
+            # print(f"get {name}", ctor, flush=True)
             self._modules[name] = ctor(*args, **kwargs)
+            print(f"got {name}", ctor, flush=True)
         return self._modules[name]
 
 
@@ -100,12 +102,16 @@ class Optimizer(tf.Module):
         varibs = tf.nest.flatten([module.variables for module in modules])
         count = sum(np.prod(x.shape) for x in varibs)
         if self._once:
-            print(f'Found {count} {self._name} parameters.')
+            print(f'Found {count} {self._name} parameters.', flush=True)
             self._once = False
+        
+        print("optim 1", flush=True)
 
         # Check loss.
         tf.debugging.check_numerics(loss, self._name + '_loss')
         metrics[f'{self._name}_loss'] = loss
+        
+        print("optim 2", flush=True)
 
         # Compute scaled gradient.
         if self._mixed:
@@ -116,11 +122,15 @@ class Optimizer(tf.Module):
             grads = self._opt.get_unscaled_gradients(grads)
         if self._mixed:
             metrics[f'{self._name}_loss_scale'] = self._opt.loss_scale
+        
+        print("optim 3", flush=True)
 
         # Distributed sync.
         context = tf.distribute.get_replica_context()
         if context:
             grads = context.all_reduce('mean', grads)
+        
+        print("optim 3", flush=True)
 
         # Gradient clipping.
         norm = tf.linalg.global_norm(grads)
@@ -129,10 +139,14 @@ class Optimizer(tf.Module):
         if self._clip:
             grads, _ = tf.clip_by_global_norm(grads, self._clip, norm)
         metrics[f'{self._name}_grad_norm'] = norm
+        
+        print("optim 4", flush=True)
 
         # Weight decay.
         if self._wd:
             self._apply_weight_decay(varibs)
+        
+        print("optim 5", flush=True)
 
         # Apply gradients.
         self._opt.apply_gradients(

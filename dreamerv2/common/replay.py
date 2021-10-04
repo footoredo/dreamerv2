@@ -68,7 +68,8 @@ class Replay:
             {k: v.dtype for k, v in example.items()},
             {k: v.shape for k, v in example.items()})
         dataset = dataset.batch(batch, drop_remainder=True)
-        dataset = dataset.prefetch(5)
+        # dataset = dataset.prefetch(5)
+        dataset = dataset.apply(tf.data.experimental.prefetch_to_device('gpu:0', 5))
         return dataset
 
     def _generate_chunks(self, length):

@@ -59,45 +59,43 @@ class Agent(common.Module):
         state = (latent, action)
         return outputs, state
 
-    @tf.function
+    @tf.function(experimental_compile=True)
     def train(self, data, state=None):
-        # print("in agent train()", flush=True)
+        print("in agent train()", flush=True)
         metrics = {}
         state, outputs, mets = self.wm.train(data, state)
         metrics.update(mets)
         start = outputs['post']
+        for k, v in start.items():
+            print(k, v.device)
         reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
         metrics.update(self._task_behavior.train(
             self.wm, start, data['is_terminal'], reward))
         if self.config.expl_behavior != 'greedy':
             mets = self._expl_behavior.train(start, outputs, data)[-1]
             metrics.update({'expl_' + key: value for key, value in mets.items()})
-        # print("out agent train()", flush=True)
+        print("out agent train()", flush=True)
         return state, metrics
 
-    @tf.function
-    def report(self, data, save_path=None):
-        print(f"in report(), save_path={save_path}")
+    @tf.function(experimental_compile=True)
+    def report(self, data, return_data=False):
+        print(f"in report(), return_data={return_data}")
         report = {}
         data = self.wm.preprocess(data)
+        rtn = None
         for key in data:
             if re.match(self.config.decoder.cnn_keys, key):
                 name = key.replace('/', '_')
-                images, rewards, actions = self.wm.video_pred(data, key)
-                report[f'openl_{name}'] = images
-                if save_path:
+                pred_dict = self.wm.video_pred(data, key)
+                report[f'openl_{name}'] = pred_dict['images']
+                if return_data:
                     # print("save pred data")
-                    import joblib
-                    joblib.dump({
-                        "images": images.numpy(), 
-                        "rewards": {
-                            "truth": rewards["truth"].numpy(),
-                            "model": rewards["model"].numpy()
-                        },
-                        "actions": actions.numpy()
-                    }, save_path)
-                
-        return report
+                    rtn = pred_dict
+
+        if return_data:  
+            return report, rtn
+        else:
+            return report
 
 
 class WorldModel(common.Module):
@@ -118,19 +116,25 @@ class WorldModel(common.Module):
         self.model_opt = common.Optimizer('model', **config.model_opt)
 
     def train(self, data, state=None):
-        # print("in wm train()", flush=True)
+        print("in wm train()", flush=True)
         with tf.GradientTape() as model_tape:
             model_loss, state, outputs, metrics = self.loss(data, state)
+        # print("1", flush=True)
         modules = [self.encoder, self.rssm, *self.heads.values()]
+        # print("2", flush=True)
         metrics.update(self.model_opt(model_tape, model_loss, modules))
-        # print("out wm train()", flush=True)
+        print("out wm train()", flush=True)
         return state, outputs, metrics
 
     def loss(self, data, state=None):
+        # print("in loss()", flush=True)
         data = self.preprocess(data)
+        # print("1", flush=True)
         embed = self.encoder(data)
+        # print("2", flush=True)
         post, prior = self.rssm.observe(
             embed, data['action'], data['is_first'], state)
+        # print("3", flush=True)
         kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
         assert len(kl_loss.shape) == 0
         likes = {}
@@ -155,10 +159,14 @@ class WorldModel(common.Module):
         metrics['prior_ent'] = self.rssm.get_dist(prior).entropy().mean()
         metrics['post_ent'] = self.rssm.get_dist(post).entropy().mean()
         last_state = {k: v[:, -1] for k, v in post.items()}
+        # print("out loss()", flush=True)
         return model_loss, last_state, outs, metrics
 
     def imagine(self, policy, start, is_terminal, horizon):
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+        print("in imagine")
+        for k, v in start.items():
+            print(k, v.device)
         start = {k: flatten(v) for k, v in start.items()}
         start['feat'] = self.rssm.get_feat(start)
         start['action'] = tf.zeros_like(policy(start['feat']).mode())
@@ -189,7 +197,7 @@ class WorldModel(common.Module):
             tf.concat([tf.ones_like(disc[:1]), disc[:-1]], 0), 0)
         return seq
 
-    @tf.function
+    @tf.function(experimental_compile=True)
     def preprocess(self, obs):
         dtype = prec.global_policy().compute_dtype
         obs = obs.copy()
@@ -210,9 +218,9 @@ class WorldModel(common.Module):
         obs['discount'] *= self.config.discount
         return obs
 
-    @tf.function
+    @tf.function(experimental_compile=True)
     def video_pred(self, data, key):
-        bootstrap_frames = 20
+        bootstrap_frames = 100
         decoder = self.heads['decoder']
         truth = data[key][:6] + 0.5
         embed = self.encoder(data)
@@ -231,7 +239,16 @@ class WorldModel(common.Module):
         video = tf.concat([truth, model, error], 2)
         B, T, H, W, C = video.shape
         actions = data['action'][:6]
-        return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C)), {"truth": truth_reward, "model": model_reward}, actions
+        ret_dict = {
+            "images": video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C)),
+            "rewards": {
+                "truth": truth_reward, 
+                "model": model_reward
+            }, 
+            "actions": actions,
+            "is_first": data['is_first'][:6]
+        }
+        return ret_dict
 
 
 class ActorCritic(common.Module):
@@ -252,7 +269,7 @@ class ActorCritic(common.Module):
         self.rewnorm = common.StreamNorm(**self.config.reward_norm)
 
     def train(self, world_model, start, is_terminal, reward_fn):
-        # print("in policy train()", flush=True)
+        print("in policy train()", flush=True)
         metrics = {}
         hor = self.config.imag_horizon
         # The weights are is_terminal flags for the imagination start states.
@@ -273,7 +290,7 @@ class ActorCritic(common.Module):
         metrics.update(self.critic_opt(critic_tape, critic_loss, self.critic))
         metrics.update(**mets1, **mets2, **mets3, **mets4)
         self.update_slow_target()  # Variables exist after first forward pass.
-        # print("out policy train()", flush=True)
+        print("out policy train()", flush=True)
         return metrics
 
     def actor_loss(self, seq, target):

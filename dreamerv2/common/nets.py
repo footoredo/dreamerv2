@@ -196,28 +196,40 @@ class Encoder(common.Module):
 
     @tf.function
     def __call__(self, obs):
+        # print("in Encoder()", flush=True)
         outs = [self._cnn(obs), self._mlp(obs)]
         outs = [out for out in outs if out is not None]
         self._once = False
+        # print("out Encoder()", flush=True)
         return tf.concat(outs, -1)
 
     def _cnn(self, obs):
+        # print("in Encoder._cnn()", flush=True)
         inputs = {
             key: tf.reshape(obs[key], (-1,) + tuple(obs[key].shape[-3:]))
             for key in obs if self._cnn_keys.match(key)}
         if not inputs:
+            # print("out Encoder._cnn()", flush=True)
             return None
+        # print("1", flush=True)
         self._once and print('Encoder CNN inputs:', list(inputs.keys()))
         x = tf.concat(list(inputs.values()), -1)
         x = x.astype(prec.global_policy().compute_dtype)
+        # print("2", flush=True)
         for i, kernel in enumerate(self._cnn_kernels):
+            # print(f"3-{i} begin", flush=True)
             depth = 2 ** i * self._cnn_depth
             x = self.get(f'conv{i}', tfkl.Conv2D, depth, kernel, 2)(x)
+            # print(f"3-{i} conv", flush=True)
             x = self.get(f'convnorm{i}', NormLayer, self._norm)(x)
+            # print(f"3-{i} convnorm", flush=True)
             x = self._act(x)
+            # print(f"3-{i} act", flush=True)
+        # print("out Encoder._cnn()", flush=True)
         return x.reshape(list(obs['image'].shape[:-3]) + [-1])
 
     def _mlp(self, obs):
+        # print("in Encoder._mlp()", flush=True)
         batch_dims = list(obs['reward'].shape)
         inputs = {
             key: tf.reshape(obs[key], [np.prod(batch_dims), -1])
@@ -232,6 +244,7 @@ class Encoder(common.Module):
             x = self.get(f'dense{i}', tfkl.Dense, width)(x)
             x = self.get(f'densenorm{i}', NormLayer, self._norm)(x)
             x = self._act(x)
+        # print("out Encoder._mlp()", flush=True)
         return x.reshape(batch_dims + [-1])
 
 

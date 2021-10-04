@@ -6,8 +6,10 @@ import re
 import sys
 import warnings
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-logging.getLogger().setLevel('ERROR')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ["TF_GPU_THREAD_COUNT"] = "4"
+logging.getLogger().setLevel('DEBUG')
 warnings.filterwarnings('ignore', '.*box bound precision lowered.*')
 
 sys.path.append(str(pathlib.Path(__file__).parent))
@@ -117,6 +119,7 @@ def train(env, config, outputs=None):
             train_agent(next(dataset))
     policy = lambda *args: agnt.policy(
         *args, mode='explore' if should_expl(step) else 'train')
+    print("before train", flush=True)
 
     def train_step(tran, worker):
         if should_train(step):
@@ -146,7 +149,7 @@ def replay(env, config, outputs=None):
     print('Logdir', logdir)
     print("Replay...")
 
-    # tf.config.experimental_run_functions_eagerly(not config.jit)
+    tf.config.experimental_run_functions_eagerly(True)
     message = 'No GPU found. To actually train on CPU remove this assert.'
     assert tf.config.experimental.list_physical_devices('GPU'), message
     for gpu in tf.config.experimental.list_physical_devices('GPU'):
@@ -155,16 +158,20 @@ def replay(env, config, outputs=None):
     if config.precision == 16:
         from tensorflow.keras.mixed_precision import experimental as prec
         prec.set_policy(prec.Policy('mixed_float16'))
-    
-    tf.config.run_functions_eagerly(True)
 
-    prefill_steps = 100
+    writer = tf.summary.create_file_writer(str(logdir))
+
+    tf.debugging.set_log_device_placement(True)
+    
+    # tf.config.run_functions_eagerly(True)
+
+    # prefill_steps = 10
 
     outputs = outputs or [
         common.TerminalOutput()
     ]
     prefill_replay = common.Replay(logdir / 'prefill_episodes', **config.replay)
-    prefill_step = common.Counter(prefill_steps)
+    prefill_step = common.Counter(prefill_replay.stats['total_steps'])
 
     print('Create envs.')
     act_space = env.act_space['action']
@@ -175,19 +182,33 @@ def replay(env, config, outputs=None):
     prefill_driver.on_reset(prefill_replay.add_step)
 
     random_agent = common.RandomAgent(num_actions, config.discrete)
-    prefill_driver(random_agent, steps=prefill_steps, episodes=1)
+    prefill_driver(random_agent, steps=config.dataset.length, episodes=1)
+
+    print("Prefill ended.", flush=True)
 
     replay = common.Replay(logdir / 'train_episodes', **config.replay)
     step = common.Counter(replay.stats['total_steps'])
     logger = common.Logger(step, outputs, multiplier=config.action_repeat)
 
-    # print('Create agent.', flush=True)
-    prefill_dataset = iter(prefill_replay.dataset(**config.dataset))
+    print('Create agent.', flush=True)
+    prefill_dataset = iter(prefill_replay.dataset(1, config.dataset.length))
+    # print('prefill_dataset')
+    # __data = next(prefill_dataset)
+    # for key, item in __data.items():
+    #     # print(key, item)
+    #     print(item.device)
+    #     break
     shapes = {k: v.shape[2:] for k, v in prefill_dataset.element_spec.items()}
     agnt = agent.Agent(config, logger, step, shapes)
-    # print('before init train', flush=True)
+    print('before init train', flush=True)
+    tf.profiler.experimental.start(str(logdir))
     agnt.train(next(prefill_dataset))
+    # return
+    tf.profiler.experimental.stop()
+    print('before load', flush=True)
     agnt.load(logdir / 'variables.pkl')
+
+    print('Load variables ended', flush=True)
 
     policy = lambda *args: agnt.policy(
         *args, mode='train')
@@ -196,9 +217,21 @@ def replay(env, config, outputs=None):
     driver.on_step(lambda tran, worker: step.increment())
     driver.on_step(replay.add_step)
     driver.on_reset(replay.add_step)
-    dataset = iter(replay.dataset(**config.dataset))
 
     while step < config.steps:
-        driver(policy, steps=config.steps)
+        print(step.value)
+        driver(policy, steps=config.steps, episodes=config.dataset.batch)
         # dataset = iter(replay.dataset(**config.dataset))
-        agnt.report(next(dataset), logdir / 'replay.data')
+    dataset = iter(replay.dataset(**config.dataset))
+    _, data = agnt.report(next(dataset), True)
+    save_path = logdir / 'replay.data'
+    import joblib
+    joblib.dump({
+        "images": data["images"].numpy(), 
+        "rewards": {
+            "truth": data["rewards"]["truth"].numpy(),
+            "model": data["rewards"]["model"].numpy()
+        },
+        "actions": data["actions"].numpy(),
+        "is_first": data["is_first"].numpy()
+    }, save_path)
