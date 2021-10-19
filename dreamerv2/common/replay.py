@@ -12,7 +12,7 @@ class Replay:
 
     def __init__(
             self, directory, capacity=0, ongoing=False, minlen=1, maxlen=0,
-            prioritize_ends=False):
+            prioritize_ends=False, start_with_first=False, indexed_sampling=False, seed=None):
         self._directory = pathlib.Path(directory).expanduser()
         self._directory.mkdir(parents=True, exist_ok=True)
         self._capacity = capacity
@@ -20,7 +20,10 @@ class Replay:
         self._minlen = minlen
         self._maxlen = maxlen
         self._prioritize_ends = prioritize_ends
-        self._random = np.random.RandomState()
+        self._start_with_first = start_with_first
+        self._indexed_sampling = indexed_sampling
+        seed = np.random.randint(0, 2 ** 31 - 1) if seed is None else seed
+        self._random = np.random.RandomState(seed)
         # filename -> key -> value_sequence
         self._complete_eps = load_episodes(self._directory, capacity, minlen)
         # worker -> key -> value_sequence
@@ -29,6 +32,7 @@ class Replay:
         self._total_episodes, self._total_steps = count_episodes(directory)
         self._loaded_episodes = len(self._complete_eps)
         self._loaded_steps = sum(eplen(x) for x in self._complete_eps.values())
+        self._counter = 0
 
     @property
     def stats(self):
@@ -68,8 +72,8 @@ class Replay:
             {k: v.dtype for k, v in example.items()},
             {k: v.shape for k, v in example.items()})
         dataset = dataset.batch(batch, drop_remainder=True)
-        # dataset = dataset.prefetch(5)
-        dataset = dataset.apply(tf.data.experimental.prefetch_to_device('gpu:0', 5))
+        dataset = dataset.prefetch(5)
+        # dataset = dataset.apply(tf.data.experimental.prefetch_to_device('gpu:0', 5))
         return dataset
 
     def _generate_chunks(self, length):
@@ -89,6 +93,9 @@ class Replay:
                     sequence = self._sample_sequence()
             chunk = {k: np.concatenate(v) for k, v in chunk.items()}
             yield chunk
+            self._counter += 1
+            if self._start_with_first:
+                sequence = self._sample_sequence()
 
     def _sample_sequence(self):
         episodes = list(self._complete_eps.values())
@@ -96,19 +103,26 @@ class Replay:
             episodes += [
                 x for x in self._ongoing_eps.values()
                 if eplen(x) >= self._minlen]
-        episode = self._random.choice(episodes)
+        if self._indexed_sampling:
+            episode = episodes[self._counter % len(episodes)]
+        else:
+            episode = self._random.choice(episodes)
         total = len(episode['action'])
         length = total
         if self._maxlen:
             length = min(length, self._maxlen)
-        # Randomize length to avoid all chunks ending at the same time in case the
-        # episodes are all of the same length.
-        length -= np.random.randint(self._minlen)
+        if not self._start_with_first:
+            # Randomize length to avoid all chunks ending at the same time in case the
+            # episodes are all of the same length.
+            length -= np.random.randint(self._minlen)
         length = max(self._minlen, length)
-        upper = total - length + 1
-        if self._prioritize_ends:
-            upper += self._minlen
-        index = min(self._random.randint(upper), total - length)
+        if self._start_with_first:
+            index = 0
+        else:
+            upper = total - length + 1
+            if self._prioritize_ends:
+                upper += self._minlen
+            index = min(self._random.randint(upper), total - length)
         sequence = {
             k: convert(v[index: index + length])
             for k, v in episode.items() if not k.startswith('log_')}

@@ -55,11 +55,18 @@ class Agent(common.Module):
             action = actor.sample()
             noise = self.config.expl_noise
         action = common.action_noise(action, noise, self.config.discrete)
+
+        # mat = np.eye(17)
+        # mat[7, 7] = 0
+        # mat[7, 0] = 1  # replace place_stone to 
+        # mat = tf.constant(mat, dtype=action.dtype)
+        # action = tf.matmul(action, mat)
+        
         outputs = {'action': action}
         state = (latent, action)
         return outputs, state
 
-    @tf.function(experimental_compile=True)
+    @tf.function(experimental_compile=False)
     def train(self, data, state=None):
         print("in agent train()", flush=True)
         metrics = {}
@@ -77,7 +84,7 @@ class Agent(common.Module):
         print("out agent train()", flush=True)
         return state, metrics
 
-    @tf.function(experimental_compile=True)
+    @tf.function(experimental_compile=False)
     def report(self, data, return_data=False):
         print(f"in report(), return_data={return_data}")
         report = {}
@@ -86,7 +93,7 @@ class Agent(common.Module):
         for key in data:
             if re.match(self.config.decoder.cnn_keys, key):
                 name = key.replace('/', '_')
-                pred_dict = self.wm.video_pred(data, key)
+                pred_dict = self.wm.video_pred(data, key, self._task_behavior)
                 report[f'openl_{name}'] = pred_dict['images']
                 if return_data:
                     # print("save pred data")
@@ -114,6 +121,8 @@ class WorldModel(common.Module):
         for name in config.grad_heads:
             assert name in self.heads, name
         self.model_opt = common.Optimizer('model', **config.model_opt)
+        self._bootstrap_frames = config.bootstrap_frames
+        self._video_pred_batches = config.video_pred_batches
 
     def train(self, data, state=None):
         print("in wm train()", flush=True)
@@ -197,7 +206,7 @@ class WorldModel(common.Module):
             tf.concat([tf.ones_like(disc[:1]), disc[:-1]], 0), 0)
         return seq
 
-    @tf.function(experimental_compile=True)
+    @tf.function(experimental_compile=False)
     def preprocess(self, obs):
         dtype = prec.global_policy().compute_dtype
         obs = obs.copy()
@@ -218,27 +227,43 @@ class WorldModel(common.Module):
         obs['discount'] *= self.config.discount
         return obs
 
-    @tf.function(experimental_compile=True)
-    def video_pred(self, data, key):
-        bootstrap_frames = 100
+    @tf.function(experimental_compile=False)
+    def video_pred(self, data, key, agent=None):
+        vb = self._video_pred_batches
+        bf = self._bootstrap_frames
         decoder = self.heads['decoder']
-        truth = data[key][:6] + 0.5
+        truth = data[key][:vb] + 0.5
         embed = self.encoder(data)
         states, _ = self.rssm.observe(
-            embed[:6, :bootstrap_frames], data['action'][:6, :bootstrap_frames], data['is_first'][:6, :bootstrap_frames])
-        recon = decoder(self.rssm.get_feat(states))[key].mode()[:6]
-        recon_reward = self.heads['reward'](self.rssm.get_feat(states)).mode()[:6]
+            embed[:vb, :bf], 
+            data['action'][:vb, :bf], 
+            data['is_first'][:vb, :bf]
+        )
+
+        state_feat = self.rssm.get_feat(states)
+
+        recon = decoder(state_feat)[key].mode()[:vb]
+        recon_reward = self.heads['reward'](state_feat).mode()[:vb]
+
         init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.rssm.imagine(data['action'][:6, bootstrap_frames:], init)
-        openl = decoder(self.rssm.get_feat(prior))[key].mode()
-        openl_reward = self.heads['reward'](self.rssm.get_feat(prior)).mode()[:6]
-        truth_reward = data['reward'][:6]
+        prior = self.rssm.imagine(data['action'][:vb, bf:], init)
+
+        prior_feat = self.rssm.get_feat(prior)
+
+        openl = decoder(prior_feat)[key].mode()
+        openl_reward = self.heads['reward'](prior_feat).mode()[:vb]
+
         model_reward = tf.concat([recon_reward, openl_reward], 1)
-        model = tf.concat([recon[:, :bootstrap_frames] + 0.5, openl + 0.5], 1)
+        model = tf.concat([recon[:, :bf] + 0.5, openl + 0.5], 1)
         error = (model - truth + 1) / 2
         video = tf.concat([truth, model, error], 2)
         B, T, H, W, C = video.shape
-        actions = data['action'][:6]
+
+        actions = data['action'][:vb]
+        truth_reward = data['reward'][:vb]
+
+        feat = tf.concat([state_feat, prior_feat], 1)
+
         ret_dict = {
             "images": video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C)),
             "rewards": {
@@ -246,8 +271,16 @@ class WorldModel(common.Module):
                 "model": model_reward
             }, 
             "actions": actions,
-            "is_first": data['is_first'][:6]
+            "is_first": data['is_first'][:vb],
+            "feat": feat
         }
+
+        if agent is not None:
+            recon_value = agent.critic(self.rssm.get_feat(states)).mode()[:vb]
+            openl_value = agent.critic(self.rssm.get_feat(prior)).mode()[:vb]
+            model_value = tf.concat([recon_value, openl_value], 1)
+            ret_dict["value"] = model_value
+
         return ret_dict
 
 

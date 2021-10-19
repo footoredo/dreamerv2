@@ -9,10 +9,23 @@ import gym
 import numpy as np
 
 
-class GymWrapper:
+class Wrapper:
+    def __init__(self, env):
+        self._env = env
+
+    def __getattr__(self, name):
+        if name.startswith('__'):
+            raise AttributeError(name)
+        try:
+            return getattr(self._env, name)
+        except AttributeError:
+            raise ValueError(name)
+
+
+class GymWrapper(Wrapper):
 
     def __init__(self, env, obs_key='image', act_key='action'):
-        self._env = env
+        super().__init__(env)
         self._obs_is_dict = hasattr(self._env.observation_space, 'spaces')
         self._act_is_dict = hasattr(self._env.action_space, 'spaces')
         self._obs_key = obs_key
@@ -325,20 +338,12 @@ class Dummy:
         }
 
 
-class TimeLimit:
+class TimeLimit(Wrapper):
 
     def __init__(self, env, duration):
-        self._env = env
+        super().__init__(env)
         self._duration = duration
         self._step = None
-
-    def __getattr__(self, name):
-        if name.startswith('__'):
-            raise AttributeError(name)
-        try:
-            return getattr(self._env, name)
-        except AttributeError:
-            raise ValueError(name)
 
     def step(self, action):
         assert self._step is not None, 'Must reset environment.'
@@ -354,23 +359,15 @@ class TimeLimit:
         return self._env.reset()
 
 
-class NormalizeAction:
+class NormalizeAction(Wrapper):
 
     def __init__(self, env, key='action'):
-        self._env = env
+        super().__init__(env)
         self._key = key
         space = env.act_space[key]
         self._mask = np.isfinite(space.low) & np.isfinite(space.high)
         self._low = np.where(self._mask, space.low, -1)
         self._high = np.where(self._mask, space.high, 1)
-
-    def __getattr__(self, name):
-        if name.startswith('__'):
-            raise AttributeError(name)
-        try:
-            return getattr(self._env, name)
-        except AttributeError:
-            raise ValueError(name)
 
     @property
     def act_space(self):
@@ -385,21 +382,16 @@ class NormalizeAction:
         return self._env.step({**action, self._key: orig})
 
 
-class OneHotAction:
+class OneHotAction(Wrapper):
 
-    def __init__(self, env, key='action'):
+    def __init__(self, env, key='action', seed=None):
         assert hasattr(env.act_space[key], 'n')
-        self._env = env
+        super().__init__(env)
         self._key = key
-        self._random = np.random.RandomState()
-
-    def __getattr__(self, name):
-        if name.startswith('__'):
-            raise AttributeError(name)
         try:
-            return getattr(self._env, name)
-        except AttributeError:
-            raise ValueError(name)
+            self._random = env._random
+        except:
+            self._random = np.random.RandomState(seed)
 
     @property
     def act_space(self):
@@ -428,10 +420,10 @@ class OneHotAction:
         return reference
 
 
-class ResizeImage:
+class ResizeImage(Wrapper):
 
     def __init__(self, env, size=(64, 64), key='image'):
-        self._env = env
+        super().__init__(env)
         self._key = key
         self._shape = size
 

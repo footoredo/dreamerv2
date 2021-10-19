@@ -39,6 +39,7 @@ configs = common.Config({k: defaults.update(v) for k, v in configs.items()})
 
 
 def train(env, config, outputs=None):
+    tf.random.set_seed(config.seed)
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
     config.save(logdir / 'config.yaml')
@@ -60,7 +61,7 @@ def train(env, config, outputs=None):
         common.JSONLOutput(config.logdir),
         common.TensorBoardOutput(config.logdir),
     ]
-    replay = common.Replay(logdir / 'train_episodes', **config.replay)
+    replay = common.Replay(logdir / 'train_episodes', seed=config.seed, **config.replay)
     step = common.Counter(replay.stats['total_steps'])
     logger = common.Logger(step, outputs, multiplier=config.action_repeat)
     metrics = collections.defaultdict(list)
@@ -142,12 +143,14 @@ def train(env, config, outputs=None):
 
 
 def replay(env, config, outputs=None):
+    os.environ['TF_DETERMINISTIC_OPS'] = 'true'
+    tf.random.set_seed(config.seed)
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
     config.save(logdir / 'config.yaml')
     print(config, '\n')
     print('Logdir', logdir)
-    print("Replay...")
+    print(f"Replay... seed={config.seed}")
 
     tf.config.experimental_run_functions_eagerly(True)
     message = 'No GPU found. To actually train on CPU remove this assert.'
@@ -170,7 +173,7 @@ def replay(env, config, outputs=None):
     outputs = outputs or [
         common.TerminalOutput()
     ]
-    prefill_replay = common.Replay(logdir / 'prefill_episodes', **config.replay)
+    prefill_replay = common.Replay(logdir / 'prefill_episodes', seed=config.seed, **config.replay)
     prefill_step = common.Counter(prefill_replay.stats['total_steps'])
 
     print('Create envs.')
@@ -186,7 +189,7 @@ def replay(env, config, outputs=None):
 
     print("Prefill ended.", flush=True)
 
-    replay = common.Replay(logdir / 'train_episodes', **config.replay)
+    replay = common.Replay(logdir / 'train_episodes', seed=config.seed, start_with_first=True, indexed_sampling=True, **config.replay)
     step = common.Counter(replay.stats['total_steps'])
     logger = common.Logger(step, outputs, multiplier=config.action_repeat)
 
@@ -211,7 +214,16 @@ def replay(env, config, outputs=None):
     print('Load variables ended', flush=True)
 
     policy = lambda *args: agnt.policy(
-        *args, mode='train')
+        *args, mode='eval')
+
+    env.reset_episode()
+    # _env = env
+    # while True:
+    #     try:
+    #         _env.reset_episode()
+    #         continue
+    #     except:
+    #         _env = _env._env
 
     driver = common.Driver([env])
     driver.on_step(lambda tran, worker: step.increment())
@@ -222,16 +234,21 @@ def replay(env, config, outputs=None):
         print(step.value)
         driver(policy, steps=config.steps, episodes=config.dataset.batch)
         # dataset = iter(replay.dataset(**config.dataset))
+
+    print("data collected!", flush=True)
+
     dataset = iter(replay.dataset(**config.dataset))
     _, data = agnt.report(next(dataset), True)
     save_path = logdir / 'replay.data'
+
+    def to_numpy(torch_dict):
+        numpy_dict = dict()
+        for name, value in torch_dict.items():
+            if type(value) == dict:
+                numpy_dict[name] = to_numpy(value)
+            else:
+                numpy_dict[name] = value.numpy()
+        return numpy_dict
+
     import joblib
-    joblib.dump({
-        "images": data["images"].numpy(), 
-        "rewards": {
-            "truth": data["rewards"]["truth"].numpy(),
-            "model": data["rewards"]["model"].numpy()
-        },
-        "actions": data["actions"].numpy(),
-        "is_first": data["is_first"].numpy()
-    }, save_path)
+    joblib.dump(to_numpy(data), save_path)
