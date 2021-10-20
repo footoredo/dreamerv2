@@ -149,6 +149,12 @@ dmc:
 
 debug:
 
+  rssm: { hidden: 64, deter: 64, stoch: 4, discrete: 4}
+  encoder: { cnn_depth: 8, cnn_kernels: [ 4, 4, 4, 4 ], mlp_layers: [ 50, 50, 50, 50 ] }
+  decoder: { cnn_depth: 8, cnn_kernels: [ 5, 5, 6, 6 ], mlp_layers: [ 50, 50, 50, 50 ] }
+  reward_head: { layers: 2, units: 50 }
+  discount_head: { layers: 2, units: 50 }
+
   jit: False
   time_limit: 100
   eval_every: 300
