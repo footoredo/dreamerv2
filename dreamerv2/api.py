@@ -144,6 +144,7 @@ def train(env, config, outputs=None):
 
 def replay(env, config, outputs=None):
     os.environ['TF_DETERMINISTIC_OPS'] = 'true'
+    # tf.config.set_visible_devices([], 'GPU')
     tf.random.set_seed(config.seed)
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)

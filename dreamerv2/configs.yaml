@@ -40,7 +40,7 @@ defaults:
   # World Model
   grad_heads: [ decoder, reward, discount ]
   pred_discount: True
-  rssm: { ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1 }
+  rssm: { use_rnn: True, ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1 }
   encoder: { mlp_keys: '$^', cnn_keys: '^image$', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [ 4, 4, 4, 4 ], mlp_layers: [ 400, 400, 400, 400 ] }
   decoder: { mlp_keys: '$^', cnn_keys: '^image$', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [ 5, 5, 6, 6 ], mlp_layers: [ 400, 400, 400, 400 ] }
   reward_head: { layers: 4, units: 400, act: elu, norm: none, dist: mse }

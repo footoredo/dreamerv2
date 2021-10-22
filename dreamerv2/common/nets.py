@@ -13,7 +13,7 @@ class EnsembleRSSM(common.Module):
 
     def __init__(
             self, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
-            act='elu', norm='none', std_act='softplus', min_std=0.1):
+            act='elu', norm='none', std_act='softplus', min_std=0.1, use_rnn=True):
         super().__init__()
         self._ensemble = ensemble
         self._stoch = stoch
@@ -24,6 +24,7 @@ class EnsembleRSSM(common.Module):
         self._norm = norm
         self._std_act = std_act
         self._min_std = min_std
+        self._use_rnn = use_rnn
         self._cell = GRUCell(self._deter, norm=True)
         self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
 
@@ -70,7 +71,10 @@ class EnsembleRSSM(common.Module):
         if self._discrete:
             shape = stoch.shape[:-2] + [self._stoch * self._discrete]
             stoch = tf.reshape(stoch, shape)
-        return tf.concat([stoch, state['deter']], -1)
+        if self._use_rnn:
+            return tf.concat([stoch, state['deter']], -1)
+        else:
+            return tf.concat([stoch, tf.zeros_like(state['deter'])], -1)
 
     def get_dist(self, state, ensemble=False):
         if ensemble:
