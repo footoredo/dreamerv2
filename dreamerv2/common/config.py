@@ -113,6 +113,7 @@ class Config(dict):
             if not keys:
                 raise KeyError(f'Unknown key or pattern {key}.')
             for key in keys:
+                # print(list(result.keys()))
                 old = result[key]
                 try:
                     if isinstance(old, int) and isinstance(new, float):

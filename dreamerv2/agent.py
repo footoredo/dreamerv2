@@ -16,7 +16,7 @@ class Agent(common.Module):
         self._num_act = shapes['action'][-1]
         self._counter = step
         self.step = tf.Variable(int(self._counter), tf.int64)
-        self.wm = WorldModel(self.step, shapes, config)
+        self.wm = WorldModel(self.step, shapes, self._num_act, config)
 
         # print("wm:", self.wm.variables)
         self._task_behavior = ActorCritic(config, self.step, self._num_act)
@@ -70,11 +70,13 @@ class Agent(common.Module):
     def train(self, data, state=None):
         print("in agent train()", flush=True)
         metrics = {}
+        # for k, v in data.items():
+        #     print(k, type(v))
         state, outputs, mets = self.wm.train(data, state)
         metrics.update(mets)
         start = outputs['post']
-        for k, v in start.items():
-            print(k, v.device)
+        # for k, v in start.items():
+        #     print(k, v.device)
         reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
         metrics.update(self._task_behavior.train(
             self.wm, start, data['is_terminal'], reward))
@@ -107,15 +109,15 @@ class Agent(common.Module):
 
 class WorldModel(common.Module):
 
-    def __init__(self, step, shapes, config):
+    def __init__(self, step, shapes, num_actions, config):
         self.step = step
         self.config = config
-        self.rssm = common.EnsembleRSSM(**config.rssm)
+        self.rssm = common.EnsembleRSSM(num_actions=num_actions, **config.rssm)
         self.encoder = common.Encoder(**config.encoder)
         self.heads = {}
         self.heads['decoder'] = common.Decoder(shapes, **config.decoder)
         self.heads['reward'] = common.MLP([], **config.reward_head)
-        print("wm.reward:", self.heads['reward'].variables)
+        # print("wm.reward:", self.heads['reward'].variables)
         if config.pred_discount:
             self.heads['discount'] = common.MLP([], **config.discount_head)
         for name in config.grad_heads:
@@ -142,19 +144,21 @@ class WorldModel(common.Module):
         embed = self.encoder(data)
         # print("2", flush=True)
         post, prior = self.rssm.observe(
-            embed, data['action'], data['is_first'], state)
+            embed, data['action'], data['is_first'], training=True, state=state)
         # print("3", flush=True)
         kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
         assert len(kl_loss.shape) == 0
         likes = {}
         losses = {'kl': kl_loss}
         feat = self.rssm.get_feat(post)
+        # print(feat.shape)
         for name, head in self.heads.items():
             grad_head = (name in self.config.grad_heads)
             inp = feat if grad_head else tf.stop_gradient(feat)
             out = head(inp)
             dists = out if isinstance(out, dict) else {name: out}
             for key, dist in dists.items():
+                print(key, data[key].shape, dist.mean().shape)
                 like = tf.cast(dist.log_prob(data[key]), tf.float32)
                 likes[key] = like
                 losses[key] = -like.mean()
@@ -167,15 +171,28 @@ class WorldModel(common.Module):
         metrics['model_kl'] = kl_value.mean()
         metrics['prior_ent'] = self.rssm.get_dist(prior).entropy().mean()
         metrics['post_ent'] = self.rssm.get_dist(post).entropy().mean()
+        # def get_last(k, v):
+        #     if k.startswith('t_'):
+        #         return v[-1]
+        #     else:
+        #         return v[:, -1]
         last_state = {k: v[:, -1] for k, v in post.items()}
         # print("out loss()", flush=True)
         return model_loss, last_state, outs, metrics
 
     def imagine(self, policy, start, is_terminal, horizon):
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-        print("in imagine")
         for k, v in start.items():
-            print(k, v.device)
+            print(k, type(v))
+            if type(v) == list:
+                print(len(v), v[0].shape)
+            else:
+                print(v.shape)
+        # print("in imagine")
+        # for k, v in start.items():
+        #     print(k, v.device)
+        # def _flatten(k, v):
+        #     if k.startswith('t_'):
         start = {k: flatten(v) for k, v in start.items()}
         start['feat'] = self.rssm.get_feat(start)
         start['action'] = tf.zeros_like(policy(start['feat']).mode())
@@ -184,7 +201,7 @@ class WorldModel(common.Module):
         seq = {k: [v] for k, v in start.items()}
         for _ in range(horizon):
             action = policy(tf.stop_gradient(seq['feat'][-1])).sample()
-            state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action)
+            state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action, training=False)
             feat = self.rssm.get_feat(state)
             for key, value in {**state, 'action': action, 'feat': feat}.items():
                 seq[key].append(value)
@@ -237,7 +254,8 @@ class WorldModel(common.Module):
         states, _ = self.rssm.observe(
             embed[:vb, :bf], 
             data['action'][:vb, :bf], 
-            data['is_first'][:vb, :bf]
+            data['is_first'][:vb, :bf],
+            training=False
         )
 
         state_feat = self.rssm.get_feat(states)
@@ -246,7 +264,7 @@ class WorldModel(common.Module):
         recon_reward = self.heads['reward'](state_feat).mode()[:vb]
 
         init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.rssm.imagine(data['action'][:vb, bf:], init)
+        prior = self.rssm.imagine(data['action'][:vb, bf:], training=False, state=init)
 
         prior_feat = self.rssm.get_feat(prior)
 

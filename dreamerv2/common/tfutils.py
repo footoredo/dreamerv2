@@ -9,7 +9,8 @@ from tensorflow.keras import mixed_precision as prec
 try:
     from tensorflow.python.distribute import values
 except Exception:
-    from google3.third_party.tensorflow.python.distribute import values
+    pass
+    # from google3.third_party.tensorflow.python.distribute import values
 
 tf.tensor = tf.convert_to_tensor
 for base in (tf.Tensor, tf.Variable, values.PerReplica):

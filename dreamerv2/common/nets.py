@@ -13,7 +13,8 @@ class EnsembleRSSM(common.Module):
 
     def __init__(
             self, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
-            act='elu', norm='none', std_act='softplus', min_std=0.1, use_rnn=True):
+            act='elu', norm='none', std_act='softplus', min_std=0.1, seq_model='rnn',
+            num_actions=None, transformer=None):
         super().__init__()
         self._ensemble = ensemble
         self._stoch = stoch
@@ -24,46 +25,82 @@ class EnsembleRSSM(common.Module):
         self._norm = norm
         self._std_act = std_act
         self._min_std = min_std
-        self._use_rnn = use_rnn
-        self._cell = GRUCell(self._deter, norm=True)
+        self._seq_model = seq_model
+        self._num_actions = num_actions
+        print("seq_model:", seq_model)
+
+        # rnn state: {"stoch": [batch_size, stoch, discrete], "deter": [batch_size, deter]}
+        # transformer state: {"stoch": [batch_size, stoch, discrete], "t_stoch": [batch_size, seq_len - 1, stoch, discrete], 
+        #                     "t_action": [batch_size, seq_len - 1, n_action], "deter": [batch_size, deter]}
+    
+        self._cell = GRUCell(self._deter, norm=True) if seq_model == "rnn" else None
+        self._memory_size = transformer.pop("memory_size")
+        self._transformer = common.Transformer(d_model=hidden, **transformer) if seq_model == "transformer" else None
         self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
 
     def initial(self, batch_size):
         dtype = prec.global_policy().compute_dtype
         if self._discrete:
+            stoch_size = [self._stoch, self._discrete]
             state = dict(
-                logit=tf.zeros([batch_size, self._stoch, self._discrete], dtype),
-                stoch=tf.zeros([batch_size, self._stoch, self._discrete], dtype),
-                deter=self._cell.get_initial_state(None, batch_size, dtype))
+                logit=tf.zeros([batch_size] + stoch_size, dtype),
+                stoch=tf.zeros([batch_size] + stoch_size, dtype))
         else:
+            stoch_size = [self._stoch]
             state = dict(
-                mean=tf.zeros([batch_size, self._stoch], dtype),
-                std=tf.zeros([batch_size, self._stoch], dtype),
-                stoch=tf.zeros([batch_size, self._stoch], dtype),
-                deter=self._cell.get_initial_state(None, batch_size, dtype))
+                mean=tf.zeros([batch_size] + stoch_size, dtype),
+                std=tf.zeros([batch_size] + stoch_size, dtype),
+                stoch=tf.zeros([batch_size] + stoch_size, dtype))
+        if self.use_rnn:
+            state['deter'] = self._cell.get_initial_state(None, batch_size, dtype)
+        elif self.use_transformer:
+            state['deter'] = tf.zeros([batch_size, self._deter], dtype)
+            state['t_stoch'] = tf.zeros([batch_size, self._memory_size] + stoch_size, dtype)
+            state['t_action'] = tf.zeros([batch_size, self._memory_size, self._num_actions], dtype)
+            # state['t_len'] = tf.zeros([batch_size, 1], dtype=tf.int32)
         return state
 
+    @property
+    def use_rnn(self):
+        return self._seq_model == 'rnn'
+
+    def use_transformer(self):
+        return self._seq_model == 'transformer'
+
     @tf.function
-    def observe(self, embed, action, is_first, state=None):
+    def observe(self, embed, action, is_first, training, state=None):
         swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
         if state is None:
             state = self.initial(tf.shape(action)[0])
         post, prior = common.static_scan(
-            lambda prev, inputs: self.obs_step(prev[0], *inputs),
+            lambda prev, inputs: self.obs_step(prev[0], *inputs, training),
             (swap(action), swap(embed), swap(is_first)), (state, state))
-        post = {k: swap(v) for k, v in post.items()}
-        prior = {k: swap(v) for k, v in prior.items()}
+        # for k, v in post.items():
+        #     print(k, type(v).__name__)
+        def _swap(k, v):
+            if k.startswith("t_"):
+                return swap(v)
+            else:
+                return swap(v)
+        post = {k: _swap(k, v) for k, v in post.items()}
+        prior = {k: _swap(k, v) for k, v in prior.items()}
         return post, prior
 
     @tf.function
-    def imagine(self, action, state=None):
+    def imagine(self, action, training, state=None):
         swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
         if state is None:
             state = self.initial(tf.shape(action)[0])
         assert isinstance(state, dict), state
         action = swap(action)
-        prior = common.static_scan(self.img_step, action, state)
-        prior = {k: swap(v) for k, v in prior.items()}
+        prior = common.static_scan(lambda prev, inputs: self.img_step(prev, inputs, training), action, state)
+        def _swap(k, v):
+            print(k, v.shape)
+            if k.startswith("t_"):
+                return swap(v)
+            else:
+                return swap(v)
+        prior = {k: _swap(k, v) for k, v in prior.items()}
         return prior
 
     def get_feat(self, state):
@@ -71,10 +108,7 @@ class EnsembleRSSM(common.Module):
         if self._discrete:
             shape = stoch.shape[:-2] + [self._stoch * self._discrete]
             stoch = tf.reshape(stoch, shape)
-        if self._use_rnn:
-            return tf.concat([stoch, state['deter']], -1)
-        else:
-            return tf.concat([stoch, tf.zeros_like(state['deter'])], -1)
+        return tf.concat([stoch, state['deter']], -1)
 
     def get_dist(self, state, ensemble=False):
         if ensemble:
@@ -91,13 +125,19 @@ class EnsembleRSSM(common.Module):
         return dist
 
     @tf.function
-    def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
+    def obs_step(self, prev_state, prev_action, embed, is_first, training, sample=True):
         # if is_first.any():
-        prev_state, prev_action = tf.nest.map_structure(
-            lambda x: tf.einsum(
-                'b,b...->b...', 1.0 - is_first.astype(x.dtype), x),
-            (prev_state, prev_action))
-        prior = self.img_step(prev_state, prev_action, sample)
+        print(list(prev_state.keys()), flush=True)
+        # prev_state, prev_action = tf.nest.map_structure(
+        #     lambda x: tf.einsum(
+        #         'b,b...->b...', 1.0 - is_first.astype(x.dtype), x),
+        #     (prev_state, prev_action))
+        mask_fn = lambda x: tf.einsum('b,b...->b...', 1.0 - is_first.astype(x.dtype), x)
+        prev_action = mask_fn(prev_action)
+        for k in prev_state.keys():
+            # if not k.startswith('t_'):
+            prev_state[k] = mask_fn(prev_state[k])
+        prior = self.img_step(prev_state, prev_action, training, sample)
         x = tf.concat([prior['deter'], embed], -1)
         x = self.get('obs_out', tfkl.Dense, self._hidden)(x)
         x = self.get('obs_out_norm', NormLayer, self._norm)(x)
@@ -106,28 +146,99 @@ class EnsembleRSSM(common.Module):
         dist = self.get_dist(stats)
         stoch = dist.sample() if sample else dist.mode()
         post = {'stoch': stoch, 'deter': prior['deter'], **stats}
+        if self.use_transformer:
+            post['t_stoch'] = tf.identity(prior['t_stoch'])
+            post['t_action'] = tf.identity(prior['t_action'])
+            # post['t_len'] = tf.identity(prior['t_len'])
         return post, prior
 
     @tf.function
-    def img_step(self, prev_state, prev_action, sample=True):
-        prev_stoch = self._cast(prev_state['stoch'])
-        prev_action = self._cast(prev_action)
+    def img_step(self, prev_state, prev_action, training, sample=True):
+        if self.use_rnn:
+            prev_stoch = self._cast(prev_state['stoch'])
+            prev_action = self._cast(prev_action)
+        elif self.use_transformer:
+            # cur_stoch = tf.expand_dims(self._cast(prev_state['stoch']), 1)
+            # cur_action = tf.expand_dims(self._cast(prev_action), 1)
+
+            # pos = prev_state['t_len'] % self._memory_size  # [batch, 1]
+            # print(prev_state['t_len'], type(prev_state['t_stoch']).__name__)
+            h_stoch = self._cast(tf.identity(prev_state['t_stoch']))
+            h_action = self._cast(tf.identity(prev_state['t_action']))
+
+            h_stoch = tf.roll(h_stoch, shift=-1, axis=1)
+            h_action = tf.roll(h_action, shift=-1, axis=1)
+
+            bs, sl = tf.shape(h_stoch)[:2]
+            indices = tf.stack([tf.range(bs), tf.ones(bs, dtype=tf.int32) * (sl - 1)], 1)
+            print(indices)
+            h_stoch = tf.tensor_scatter_nd_update(h_stoch, indices, self._cast(prev_state['stoch']))
+            h_action = tf.tensor_scatter_nd_update(h_action, indices, self._cast(prev_action))
+            # h_stoch[:, -1].assign(self._cast(prev_state['stoch']))
+            # h_action[:, -1].assign(self._cast(prev_action))
+
+            # h_stoch[pos] = self._cast(prev_state['stoch'])
+            # h_action[pos] = self._cast(prev_action)
+            # pos = tf.concat([tf.expand_dims(tf.range(pos.shape[0]), -1), pos], -1)
+            # h_stoch = tf.tensor_scatter_nd_update(h_stoch, pos, self._cast(prev_state['stoch']))
+            # h_action = tf.tensor_scatter_nd_update(h_action, pos, self._cast(prev_action))
+            # h_stoch[:, pos].assign(self._cast(prev_state['stoch']))
+            # h_action[:, pos].assign(self._cast(prev_action))
+
+            # if prev_state['t_stoch'] is not None:
+            #     prev_stoch = tf.concat([self._cast(prev_state['t_stoch']), cur_stoch], 1)
+            #     prev_action = tf.concat([self._cast(prev_state['t_action']), cur_action], 1)
+            # else:
+            #     prev_stoch = cur_stoch
+            #     prev_action = cur_action
+
+            # seq_len = tf.shape(prev_stoch)[1]
+            # if seq_len > self._max_memory:
+            #     prev_stoch = prev_stoch[:, 1:]
+            #     prev_action = prev_action[:, 1:]
+            _prev_stoch = tf.identity(h_stoch)
+            _prev_action = tf.identity(h_action)
+
+            prev_stoch = _prev_stoch
+            prev_action = _prev_action
+
+            # print(h_stoch[0].shape, h_action[1].shape)
+
+            # print(h_stoch.shape, h_action.shape)
+            # prev_stoch = tf.concat([h_stoch[:, pos + 1:], h_stoch[:, :pos + 1]], 1)
+            # prev_action = tf.concat([h_action[:, pos + 1:], h_action[:, :pos + 1]], 1)
+            # prev_stoch = tf.roll(h_stoch, )
+
         if self._discrete:
             shape = prev_stoch.shape[:-2] + [self._stoch * self._discrete]
             prev_stoch = tf.reshape(prev_stoch, shape)
+
         x = tf.concat([prev_stoch, prev_action], -1)
         x = self.get('img_in', tfkl.Dense, self._hidden)(x)
         x = self.get('img_in_norm', NormLayer, self._norm)(x)
         x = self._act(x)
-        deter = prev_state['deter']
-        x, deter = self._cell(x, [deter])
-        deter = deter[0]  # Keras wraps the state in a list.
+
+        if self.use_rnn:
+            deter = prev_state['deter']
+            x, deter = self._cell(x, [deter])
+            deter = deter[0]  # Keras wraps the state in a list.
+        elif self.use_transformer:
+            # x: [batch_size, seq_len, hidden]
+            deter, _ = self._transformer(x, training=training)  # [batch_size, seq_len, hidden]
+            x = deter = deter[:, -1, :]  # [batch_size, hidden]
+
         stats = self._suff_stats_ensemble(x)
         index = tf.random.uniform((), 0, self._ensemble, tf.int32)
         stats = {k: v[index] for k, v in stats.items()}
         dist = self.get_dist(stats)
-        stoch = dist.sample() if sample else dist.mode()
+        stoch = dist.sample() if sample else dist.mode()  # [batch_size, ]
+
         prior = {'stoch': stoch, 'deter': deter, **stats}
+        if self.use_transformer:
+            prior['t_stoch'] = _prev_stoch
+            prior['t_action'] = _prev_action
+            # prior['t_len'] = prev_state['t_len'] + 1
+
         return prior
 
     def _suff_stats_ensemble(self, inp):
@@ -258,6 +369,7 @@ class Decoder(common.Module):
             self, shapes, cnn_keys=r'image', mlp_keys=r'^$', act='elu', norm='none',
             cnn_depth=48, cnn_kernels=(4, 4, 4, 4), mlp_layers=[400, 400, 400, 400]):
         self._shapes = shapes
+        # print('decoder:', shapes)
         self._cnn_keys = re.compile(cnn_keys)
         self._mlp_keys = re.compile(mlp_keys)
         self._act = get_act(act)

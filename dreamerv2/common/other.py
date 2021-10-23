@@ -39,9 +39,16 @@ def static_scan(fn, inputs, start, reverse=False):
         inp = tf.nest.map_structure(lambda x: x[index], inputs)
         last = fn(last, inp)
         [o.append(l) for o, l in zip(outputs, tf.nest.flatten(last))]
+        print(index, len(outputs))
     if reverse:
         outputs = [list(reversed(x)) for x in outputs]
+    # def nested_stack(x):
+    #     if type(x[0]) == list:
+    #         x = [nested_stack(_x) for _x in x]
+    #     return tf.stack(x, 0)
     outputs = [tf.stack(x, 0) for x in outputs]
+    # for i, x in enumerate(outputs):
+    #     print(type(x))
     return tf.nest.pack_sequence_as(start, outputs)
 
 

@@ -40,7 +40,8 @@ defaults:
   # World Model
   grad_heads: [ decoder, reward, discount ]
   pred_discount: True
-  rssm: { use_rnn: True, ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1 }
+  rssm: { seq_model: 'rnn', ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1, 
+          transformer: { num_layers: 2, num_heads: 8, memory_size: 256, pe_input: 10000, dff: 2048 } }
   encoder: { mlp_keys: '$^', cnn_keys: '^image$', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [ 4, 4, 4, 4 ], mlp_layers: [ 400, 400, 400, 400 ] }
   decoder: { mlp_keys: '$^', cnn_keys: '^image$', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [ 5, 5, 6, 6 ], mlp_layers: [ 400, 400, 400, 400 ] }
   reward_head: { layers: 4, units: 400, act: elu, norm: none, dist: mse }
@@ -149,9 +150,9 @@ dmc:
 
 debug:
 
-  rssm: { hidden: 64, deter: 64, stoch: 4, discrete: 4}
-  encoder: { cnn_depth: 8, cnn_kernels: [ 4, 4, 4, 4 ], mlp_layers: [ 50, 50, 50, 50 ] }
-  decoder: { cnn_depth: 8, cnn_kernels: [ 5, 5, 6, 6 ], mlp_layers: [ 50, 50, 50, 50 ] }
+  rssm: { hidden: 64, deter: 64, stoch: 4, discrete: 4, transformer: { num_layers: 2, num_heads: 8, pe_input: 1000, dff: 128 } }
+  encoder: { cnn_depth: 8, cnn_kernels: [ 4, 4 ], mlp_layers: [ 50, 50 ] }
+  decoder: { cnn_depth: 8, cnn_kernels: [ 5, 6 ], mlp_layers: [ 50, 50 ] }
   reward_head: { layers: 2, units: 50 }
   discount_head: { layers: 2, units: 50 }
 
@@ -164,7 +165,6 @@ debug:
   train_steps: 1
   replay: { minlen: 10, maxlen: 30 }
   dataset: { batch: 10, length: 10 }
-
 
 replay:
 
