@@ -72,14 +72,27 @@ class Agent(common.Module):
         metrics = {}
         # for k, v in data.items():
         #     print(k, type(v))
-        state, outputs, mets = self.wm.train(data, state)
+        state, outputs, mets, model_loss, prior = self.wm.train(data, state)
         metrics.update(mets)
         start = outputs['post']
+        if self.config.make_graph:
+            return model_loss
+        # print("self.wm.train states:", flush=True)
+        # for k, v in start.items():
+        #     p = 1
+        #     for d in v.shape:
+        #         p *= d
+        #     print(k, v.shape, p)
         # for k, v in start.items():
         #     print(k, v.device)
-        reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
+        # return model_loss, prior
+        def reward_fn(seq):
+            r = self.wm.heads['reward'](seq['feat']).mode()
+            if self.config.use_int_reward:
+                r += self.config.int_reward_coef * self.wm.heads['int_reward'](seq['feat']).mode()
+            return r
         metrics.update(self._task_behavior.train(
-            self.wm, start, data['is_terminal'], reward))
+            self.wm, start, data['is_terminal'], reward_fn))
         if self.config.expl_behavior != 'greedy':
             mets = self._expl_behavior.train(start, outputs, data)[-1]
             metrics.update({'expl_' + key: value for key, value in mets.items()})
@@ -117,6 +130,10 @@ class WorldModel(common.Module):
         self.heads = {}
         self.heads['decoder'] = common.Decoder(shapes, **config.decoder)
         self.heads['reward'] = common.MLP([], **config.reward_head)
+        self._use_int_reward = config.use_int_reward
+        if self._use_int_reward:
+            print("use int reward!", flush=True)
+            self.heads['int_reward'] = common.MLP([], **config.reward_head)
         # print("wm.reward:", self.heads['reward'].variables)
         if config.pred_discount:
             self.heads['discount'] = common.MLP([], **config.discount_head)
@@ -125,17 +142,22 @@ class WorldModel(common.Module):
         self.model_opt = common.Optimizer('model', **config.model_opt)
         self._bootstrap_frames = config.bootstrap_frames
         self._video_pred_batches = config.video_pred_batches
+        # self._running_stats = {}
 
     def train(self, data, state=None):
         print("in wm train()", flush=True)
         with tf.GradientTape() as model_tape:
-            model_loss, state, outputs, metrics = self.loss(data, state)
+            model_loss, state, outputs, metrics, prior = self.loss(data, state)
+        print("model_loss", model_loss, flush=True)
+        print(metrics.keys(), flush=True)
+        for k, v in metrics.items():
+            print(k, v, flush=True)
         # print("1", flush=True)
         modules = [self.encoder, self.rssm, *self.heads.values()]
         # print("2", flush=True)
         metrics.update(self.model_opt(model_tape, model_loss, modules))
         print("out wm train()", flush=True)
-        return state, outputs, metrics
+        return state, outputs, metrics, model_loss, prior
 
     def loss(self, data, state=None):
         # print("in loss()", flush=True)
@@ -153,6 +175,8 @@ class WorldModel(common.Module):
         feat = self.rssm.get_feat(post)
         # print(feat.shape)
         for name, head in self.heads.items():
+            if name == "int_reward": 
+                continue
             grad_head = (name in self.config.grad_heads)
             inp = feat if grad_head else tf.stop_gradient(feat)
             out = head(inp)
@@ -160,14 +184,54 @@ class WorldModel(common.Module):
             for key, dist in dists.items():
                 print(key, data[key].shape, dist.mean().shape)
                 like = tf.cast(dist.log_prob(data[key]), tf.float32)
+                # if not key in self._running_stats:
+                #     self._running_stats[key] = common.RunningStats(like.shape)
+                # self._running_stats[key].push(-like)
                 likes[key] = like
                 losses[key] = -like.mean()
-        model_loss = sum(
-            self.config.loss_scales.get(k, 1.0) * v for k, v in losses.items())
+        
+        metrics = {}
+        if self._use_int_reward:
+            model_like = 0
+            print("in calc int")
+            for k, v in likes.items():
+                _v = (v.mean() - v) / (v.std() + 1e-8)
+                mask = tf.cast(_v > 1, tf.float32)
+                _v = mask * _v  # only keep significant reward (> 1 std)
+                print(k, _v.shape)
+                metrics[f'{k}_like_max'] = _v.max()
+                metrics[f'{k}_like_min'] = _v.min()
+                metrics[f'{k}_like_std'] = _v.std()
+                model_like += self.config.int_reward_scales.get(k, 0.0) * _v
+            int_reward = model_like
+            data["int_reward"] = int_reward
+            inp = tf.stop_gradient(feat)
+            # inp = feat
+            dist = self.heads["int_reward"](inp)
+            like = tf.cast(dist.log_prob(int_reward), tf.float32)
+            # print("model_like", model_like.shape, inp.shape, like.shape, flush=True)
+            likes["int_reward"] = like
+            losses["int_reward"] = -like.mean()
+            metrics['int_reward_max'] = int_reward.max()
+            metrics['int_reward_min'] = int_reward.min()
+            metrics['int_reward_mean'] = int_reward.mean()
+            metrics['int_reward_std'] = int_reward.std()
+            
+        model_loss = 0
+        if self._use_int_reward:
+            model_loss += losses["int_reward"]
+        # print("losses:", flush=True)
+        # model_loss = tf.zeros([], dtype=tf.float32)
+        for k, v in losses.items():
+            # print(k, v.shape, self.config.loss_scales.get(k, 1.0), flush=True)
+            model_loss += self.config.loss_scales.get(k, 1.0) * v
+            
+        # model_loss = sum(
+        #     self.config.loss_scales.get(k, 1.0) * v for k, v in losses.items())
         outs = dict(
             embed=embed, feat=feat, post=post,
             prior=prior, likes=likes, kl=kl_value)
-        metrics = {f'{name}_loss': value for name, value in losses.items()}
+        metrics.update({f'{name}_loss': value for name, value in losses.items()})
         metrics['model_kl'] = kl_value.mean()
         metrics['prior_ent'] = self.rssm.get_dist(prior).entropy().mean()
         metrics['post_ent'] = self.rssm.get_dist(post).entropy().mean()
@@ -178,16 +242,16 @@ class WorldModel(common.Module):
         #         return v[:, -1]
         last_state = {k: v[:, -1] for k, v in post.items()}
         # print("out loss()", flush=True)
-        return model_loss, last_state, outs, metrics
+        return model_loss, last_state, outs, metrics, prior
 
     def imagine(self, policy, start, is_terminal, horizon):
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-        for k, v in start.items():
-            print(k, type(v))
-            if type(v) == list:
-                print(len(v), v[0].shape)
-            else:
-                print(v.shape)
+        # for k, v in start.items():
+        #     print(k, type(v))
+        #     if type(v) == list:
+        #         print(len(v), v[0].shape)
+        #     else:
+        #         print(v.shape)
         # print("in imagine")
         # for k, v in start.items():
         #     print(k, v.device)
@@ -198,13 +262,22 @@ class WorldModel(common.Module):
         start['action'] = tf.zeros_like(policy(start['feat']).mode())
         # print("in imagine:", start.keys())  # dict_keys(['logit', 'stoch', 'deter', 'feat', 'action'])
         # print("in imagine:", start.items())
-        seq = {k: [v] for k, v in start.items()}
-        for _ in range(horizon):
+        seq = {k: [v[:]] for k, v in start.items() if not k.startswith('t_')}
+        t_states = {k: v[:] for k, v in start.items() if k.startswith('t_')}
+        for h in range(horizon):
             action = policy(tf.stop_gradient(seq['feat'][-1])).sample()
-            state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action, training=False)
+            states = {k: v[-1][:] for k, v in seq.items()}
+            states.update({k: v[:] for k, v in t_states.items()})
+            state = self.rssm.img_step(states, action[:], training=False)
             feat = self.rssm.get_feat(state)
+            print("horizon", h)
             for key, value in {**state, 'action': action, 'feat': feat}.items():
-                seq[key].append(value)
+                # print()
+                if key.startswith('t_'):
+                    t_states[key] = value
+                else:
+                    seq[key].append(value)
+                print(key, value.shape)
         seq = {k: tf.stack(v, 0) for k, v in seq.items()}
         if 'discount' in self.heads:
             disc = self.heads['discount'](seq['feat']).mean()
@@ -213,7 +286,7 @@ class WorldModel(common.Module):
                 # discount factor from the replay buffer.
                 true_first = 1.0 - flatten(is_terminal).astype(disc.dtype)
                 true_first *= self.config.discount
-                disc = tf.concat([true_first[None], disc[1:]], 0)
+                disc = tf.concat([true_first[:][None], disc[1:]], 0)
         else:
             disc = self.config.discount * tf.ones(seq['feat'].shape[:-1])
         seq['discount'] = disc
@@ -262,6 +335,7 @@ class WorldModel(common.Module):
 
         recon = decoder(state_feat)[key].mode()[:vb]
         recon_reward = self.heads['reward'](state_feat).mode()[:vb]
+        recon_discount = self.heads['discount'](state_feat).mode()[:vb]
 
         init = {k: v[:, -1] for k, v in states.items()}
         prior = self.rssm.imagine(data['action'][:vb, bf:], training=False, state=init)
@@ -270,8 +344,10 @@ class WorldModel(common.Module):
 
         openl = decoder(prior_feat)[key].mode()
         openl_reward = self.heads['reward'](prior_feat).mode()[:vb]
+        openl_discount = self.heads['discount'](prior_feat).mode()[:vb]
 
         model_reward = tf.concat([recon_reward, openl_reward], 1)
+        model_discount = tf.concat([recon_discount, openl_discount], 1)
         model = tf.concat([recon[:, :bf] + 0.5, openl + 0.5], 1)
         error = (model - truth + 1) / 2
         video = tf.concat([truth, model, error], 2)
@@ -279,6 +355,7 @@ class WorldModel(common.Module):
 
         actions = data['action'][:vb]
         truth_reward = data['reward'][:vb]
+        truth_discount = data['discount'][:vb]
 
         feat = tf.concat([state_feat, prior_feat], 1)
 
@@ -288,10 +365,18 @@ class WorldModel(common.Module):
                 "truth": truth_reward, 
                 "model": model_reward
             }, 
+            "discounts": {
+                "truth": truth_discount,
+                "model": model_discount
+            },
             "actions": actions,
             "is_first": data['is_first'][:vb],
-            "feat": feat
+            "feat": feat,
         }
+        
+        if self.config.use_int_reward:
+            int_reward = self.heads['int_reward'](feat).mode()[:vb]
+            ret_dict['model_int_reward'] = int_reward
 
         if agent is not None:
             recon_value = agent.critic(self.rssm.get_feat(states)).mode()[:vb]

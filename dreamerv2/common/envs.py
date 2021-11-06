@@ -176,12 +176,15 @@ class Atari:
             life_done=False, sticky=True, all_actions=False):
         assert size[0] == size[1]
         import gym.wrappers
+        import ale_py
+        # from ale_py.gym import ALGymEnv
         import gym.envs.atari
         if name == 'james_bond':
             name = 'jamesbond'
+        # name = "".join(list(map(lambda x: x.capitalize(), name.split('_'))))
         with self.LOCK:
             env = gym.envs.atari.AtariEnv(
-                game=name, obs_type='image', frameskip=1,
+                game=name, obs_type='rgb', frameskip=1,
                 repeat_action_probability=0.25 if sticky else 0.0,
                 full_action_space=all_actions)
         # Avoid unnecessary rendering in inner env.
@@ -206,6 +209,9 @@ class Atari:
     @property
     def act_space(self):
         return {'action': self._env.action_space}
+    
+    def seed(self, seed=None):
+        return self._env.seed(seed)
 
     def step(self, action):
         image, reward, done, info = self._env.step(action['action'])
@@ -213,7 +219,7 @@ class Atari:
             image = image[..., None]
         return {
             'image': image,
-            'ram': self._env.env._get_ram(),
+            'ram': self._env.env.ale.getRAM(),
             'reward': reward,
             'is_first': False,
             'is_last': done,
@@ -227,7 +233,7 @@ class Atari:
             image = image[..., None]
         return {
             'image': image,
-            'ram': self._env.env._get_ram(),
+            'ram': self._env.env.ale.getRAM(),
             'reward': 0.0,
             'is_first': True,
             'is_last': False,

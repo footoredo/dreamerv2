@@ -11,7 +11,7 @@ def get_angles(pos, i, d_model):
     return pos * angle_rates
 
 
-def positional_encoding(position, d_model, dtype):
+def positional_encoding(position, d_model):
     angle_rads = get_angles(np.arange(position)[:, np.newaxis],
                             np.arange(d_model)[np.newaxis, :],
                             d_model)
@@ -24,12 +24,19 @@ def positional_encoding(position, d_model, dtype):
 
     pos_encoding = angle_rads[np.newaxis, ...]
 
-    return tf.cast(pos_encoding, dtype=dtype)
-
+    return pos_encoding
 
 def create_look_ahead_mask(size, dtype):
     mask = 1 - tf.linalg.band_part(tf.ones((size, size), dtype=dtype), -1, 0)
     return mask  # (seq_len, seq_len)
+
+
+def create_padding_mask(seq, dtype):
+    seq = tf.cast(tf.math.equal((seq ** 2).sum(-1), 0), dtype)
+
+    # add extra dimensions to add the padding
+    # to the attention logits.
+    return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
 
 
 def scaled_dot_product_attention(q, k, v, mask, dtype):
@@ -51,6 +58,7 @@ def scaled_dot_product_attention(q, k, v, mask, dtype):
     """
 
     matmul_qk = tf.matmul(q, k, transpose_b=True)  # (..., seq_len_q, seq_len_k)
+    print("matmul_qk", matmul_qk.shape, "(..., seq_len_q, seq_len_k)")
 
     # scale matmul_qk
     dk = tf.cast(tf.shape(k)[-1], dtype)
@@ -58,15 +66,18 @@ def scaled_dot_product_attention(q, k, v, mask, dtype):
 
     # add the mask to the scaled tensor.
     if mask is not None:
-        scaled_attention_logits += (mask * -1e9)
+        scaled_attention_logits += (mask * -1e4)
+    scaled_attention_logits_1 = tf.stop_gradient(tf.identity(scaled_attention_logits))
 
     # softmax is normalized on the last axis (seq_len_k) so that the scores
     # add up to 1.
     attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)  # (..., seq_len_q, seq_len_k)
+    print("attention_weights", attention_weights.shape, "(..., seq_len_q, seq_len_k)")
 
     output = tf.matmul(attention_weights, v)  # (..., seq_len_q, depth_v)
+    print("output", output.shape, "(..., seq_len_q, depth_v)")
 
-    return output, attention_weights
+    return output, scaled_attention_logits_1
 
 
 class MultiHeadAttention(common.Module):
@@ -92,20 +103,29 @@ class MultiHeadAttention(common.Module):
         q = self.get("wq", tfkl.Dense, self._d_model)(q)   # (batch_size, seq_len, d_model)
         k = self.get("wk", tfkl.Dense, self._d_model)(k)   # (batch_size, seq_len, d_model)
         v = self.get("wv", tfkl.Dense, self._d_model)(v)   # (batch_size, seq_len, d_model)
+        print("q", q.shape, "(batch_size, seq_len, d_model)")
+        print("k", k.shape, "(batch_size, seq_len, d_model)")
+        print("v", v.shape, "(batch_size, seq_len, d_model)")
 
         q = self._split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
         k = self._split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
         v = self._split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
+        print("q", q.shape, "(batch_size, num_heads, seq_len_q, depth)")
+        print("k", k.shape, "(batch_size, num_heads, seq_len_k, depth)")
+        print("v", v.shape, "(batch_size, num_heads, seq_len_v, depth)")
 
         # scaled_attention.shape == (batch_size, num_heads, seq_len_q, depth)
         # attention_weights.shape == (batch_size, num_heads, seq_len_q, seq_len_k)
         scaled_attention, attention_weights = scaled_dot_product_attention(q, k, v, mask, self._dtype)
 
         scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])  # (batch_size, seq_len_q, num_heads, depth)
+        print("scaled_attention", scaled_attention.shape, "(batch_size, seq_len_q, num_heads, depth)")
 
         concat_attention = tf.reshape(scaled_attention, (batch_size, -1, self._d_model))  # (batch_size, seq_len_q, d_model)
+        print("concat_attention", concat_attention.shape, "(batch_size, seq_len_q, d_model)")
 
         output = self.get("dense", tfkl.Dense, self._d_model)(concat_attention)  # (batch_size, seq_len_q, d_model)
+        print("output", output.shape, "(batch_size, seq_len_q, d_model)")
 
         return output, attention_weights
 
@@ -141,11 +161,11 @@ class EncoderLayer(common.Module):
     def __call__(self, x, training, mask):
 
         attn_output, attention_weights = self.get("mha", self._mha_fn)(x, x, x, mask)  # (batch_size, input_seq_len, d_model)
-        attn_output = self.get("dropout1", self._drop_fn)(attn_output, training=training)
+        # attn_output = self.get("dropout1", self._drop_fn)(attn_output, training=training)
         out1 = self.get("layernorm1", self._ln_fn)(x + attn_output)  # (batch_size, input_seq_len, d_model)
 
         ffn_output = self.get("ffn", self._ffn_fn)(out1)  # (batch_size, input_seq_len, d_model)
-        ffn_output = self.get("dropout2", self._drop_fn)(ffn_output, training=training)
+        # ffn_output = self.get("dropout2", self._drop_fn)(ffn_output, training=training)
         out2 = self.get("layernorm2", self._ln_fn)(out1 + ffn_output)  # (batch_size, input_seq_len, d_model)
 
         return out2, attention_weights
@@ -187,7 +207,7 @@ class Encoder(common.Module):
         self._num_layers = num_layers
         self._dtype = dtype or prec.global_policy().compute_dtype
 
-        self._pos_encoding = positional_encoding(maximum_position_encoding, d_model, self._dtype)
+        self._pe = positional_encoding(maximum_position_encoding, d_model)
         self._enc_fn = lambda: EncoderLayer(d_model, num_heads, dff, rate)
         self._drop_fn = lambda: tfkl.Dropout(rate)
 
@@ -204,17 +224,17 @@ class Encoder(common.Module):
 
         # adding embedding and position encoding.
         x *= tf.math.sqrt(tf.cast(self._d_model, self._dtype))
-        x += self._pos_encoding[:, :seq_len, :]
+        # pos_encoding = self.get('pos_encoding', self._pe_fn)
+        pe = tf.constant(self._pe, self._dtype)
+        x += pe[:, :seq_len, :]
 
-        x = self.get("dropout", self._drop_fn)(x, training=training)
-        # x = self.dropout(x, training=training)
+        # x = self.get("dropout", self._drop_fn)(x, training=training)
 
         attention_weights = dict()
 
         for i in range(self._num_layers):
             x, w = self.get(f"enc{i}", self._enc_fn)(x, training, mask)
-            attention_weights[f"enc{i}"] = w
-            # x = self.enc_layers[i](x, training, mask)
+            attention_weights[f"enc{i}"] = tf.stop_gradient(w)
 
         return x, attention_weights  # (batch_size, input_seq_len, d_model)
 
@@ -260,6 +280,7 @@ class Transformer(common.Module):
     def __init__(self, num_layers, d_model, num_heads, dff, pe_input, rate=0.1, dtype=None):
         super().__init__()
         self._dtype = dtype or prec.global_policy().compute_dtype
+        self._d_model = d_model
 
         self._encoder_fn = lambda: Encoder(num_layers, d_model, num_heads, dff, pe_input, rate)
 
@@ -267,6 +288,9 @@ class Transformer(common.Module):
     def __call__(self, inp, training):
 
         # look_ahead_mask = create_look_ahead_mask(tf.shape(inp)[1], self._dtype)
-        output, attention_weights = self.get("encoder", self._encoder_fn)(inp, training, None)  # (batch_size, inp_seq_len, d_model)
+        padding_mask = tf.stop_gradient(create_padding_mask(inp, self._dtype))
+        x = self.get("dense", tfkl.Dense, self._d_model)(inp)
+        # padding_mask = None
+        output, attention_weights = self.get("encoder", self._encoder_fn)(x, training, padding_mask)  # (batch_size, inp_seq_len, d_model)
 
-        return output, attention_weights
+        return output, attention_weights, padding_mask

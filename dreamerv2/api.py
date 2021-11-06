@@ -16,6 +16,7 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 
 import numpy as np
 import ruamel.yaml as yaml
+import joblib
 import tensorflow as tf
 
 import agent
@@ -111,7 +112,47 @@ def train(env, config, outputs=None):
     shapes = {k: v.shape[2:] for k, v in dataset.element_spec.items()}
     agnt = agent.Agent(config, logger, step, shapes)
     train_agent = common.CarryOverState(agnt.train)
-    train_agent(next(dataset))  
+    # tf.profiler.experimental.start(str(logdir))
+    if config.make_graph:
+        model_loss = agnt.train.get_concrete_function(next(dataset))
+        graph = model_loss.graph
+        writer = tf.summary.create_file_writer(str(logdir))
+        with writer.as_default():
+            tf.summary.graph(graph)
+            tf.summary.flush()
+        return
+    else:
+        train_agent(next(dataset))
+    # model_loss, prior = agnt.train(next(dataset))
+    # print(model_loss)
+    # print(weights)
+    # print(mask, flush=True)
+    # print(t_hidden, flush=True)
+    # _prior = dict()
+    # for k, v in prior.items():
+    #     _prior[k] = v.numpy()
+    # joblib.dump(_prior, logdir / "prior.data")
+    # return
+    # model_loss = agnt.train.get_concrete_function(next(dataset))
+    # graph = model_loss.graph
+    # # logger.write()
+    # writer = tf.summary.create_file_writer(str(logdir))
+    # with writer.as_default():
+    #     tf.summary.graph(graph)
+    #     tf.summary.flush()
+    # tf.summary.flush()
+    # return
+    # for node in graph.as_graph_def().node:
+    #     print(f'{node.input} -> {node.name}')
+    # logger.write()
+    # logger.write()
+    # with writer.as_default():
+    #     tf.summary.trace_export(
+    #     name="my_func_trace",
+    #     profiler_outdir=str(logdir))
+    # logger.write()
+    # tf.profiler.experimental.stop()
+    # return
     if (logdir / 'variables.pkl').exists():
         agnt.load(logdir / 'variables.pkl')
     else:
@@ -124,8 +165,10 @@ def train(env, config, outputs=None):
 
     def train_step(tran, worker):
         if should_train(step):
-            for _ in range(config.train_steps):
+            for i in range(config.train_steps):
+                print("train", step.value, i, flush=True)
                 mets = train_agent(next(dataset))
+                print("finished", step.value, i, flush=True)
                 [metrics[key].append(value) for key, value in mets.items()]
         if should_log(step):
             for name, values in metrics.items():
@@ -136,10 +179,15 @@ def train(env, config, outputs=None):
 
     driver.on_step(train_step)
 
+    if config.benchmark:
+        tf.profiler.experimental.start(str(logdir))
     while step < config.steps:
+        print("step", step.value)
         logger.write()
         driver(policy, steps=config.eval_every)
         agnt.save(logdir / 'variables.pkl')
+    if config.benchmark:
+        tf.profiler.experimental.stop()
 
 
 def replay(env, config, outputs=None):
@@ -186,7 +234,7 @@ def replay(env, config, outputs=None):
     prefill_driver.on_reset(prefill_replay.add_step)
 
     random_agent = common.RandomAgent(num_actions, config.discrete)
-    prefill_driver(random_agent, steps=config.dataset.length, episodes=1)
+    prefill_driver(random_agent, steps=1, episodes=1)
 
     print("Prefill ended.", flush=True)
 
@@ -195,7 +243,7 @@ def replay(env, config, outputs=None):
     logger = common.Logger(step, outputs, multiplier=config.action_repeat)
 
     print('Create agent.', flush=True)
-    prefill_dataset = iter(prefill_replay.dataset(1, config.dataset.length))
+    prefill_dataset = iter(prefill_replay.dataset(1, 1))
     # print('prefill_dataset')
     # __data = next(prefill_dataset)
     # for key, item in __data.items():
@@ -205,19 +253,20 @@ def replay(env, config, outputs=None):
     shapes = {k: v.shape[2:] for k, v in prefill_dataset.element_spec.items()}
     agnt = agent.Agent(config, logger, step, shapes)
     print('before init train', flush=True)
-    tf.profiler.experimental.start(str(logdir))
     agnt.train(next(prefill_dataset))
     # return
-    tf.profiler.experimental.stop()
     print('before load', flush=True)
     agnt.load(logdir / 'variables.pkl')
 
     print('Load variables ended', flush=True)
 
     policy = lambda *args: agnt.policy(
-        *args, mode='eval')
+        *args, mode='train')
 
-    env.reset_episode()
+    try:
+        env.reset_episode()
+    except ValueError:
+        pass
     # _env = env
     # while True:
     #     try:
@@ -231,15 +280,18 @@ def replay(env, config, outputs=None):
     driver.on_step(replay.add_step)
     driver.on_reset(replay.add_step)
 
-    while step < config.steps:
-        print(step.value)
-        driver(policy, steps=config.steps, episodes=config.dataset.batch)
+    # print("step:", step.value, flush=True)
+    # while step < config.steps:
+    #     print("step:", step.value, flush=True)
+    driver(policy, steps=config.steps, episodes=config.dataset.batch)
         # dataset = iter(replay.dataset(**config.dataset))
 
     print("data collected!", flush=True)
 
     dataset = iter(replay.dataset(**config.dataset))
+    tf.profiler.experimental.start(str(logdir))
     _, data = agnt.report(next(dataset), True)
+    tf.profiler.experimental.stop()
     save_path = logdir / 'replay.data'
 
     def to_numpy(torch_dict):

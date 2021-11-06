@@ -13,8 +13,8 @@ class EnsembleRSSM(common.Module):
 
     def __init__(
             self, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
-            act='elu', norm='none', std_act='softplus', min_std=0.1, seq_model='rnn',
-            num_actions=None, transformer=None):
+            act='elu', norm='none', std_act='softplus', min_std=0.1, exclude_deter_feat=False,
+            seq_model='rnn', num_actions=None, transformer=None):
         super().__init__()
         self._ensemble = ensemble
         self._stoch = stoch
@@ -27,6 +27,7 @@ class EnsembleRSSM(common.Module):
         self._min_std = min_std
         self._seq_model = seq_model
         self._num_actions = num_actions
+        self._exclude_deter_feat = exclude_deter_feat
         print("seq_model:", seq_model)
 
         # rnn state: {"stoch": [batch_size, stoch, discrete], "deter": [batch_size, deter]}
@@ -35,7 +36,7 @@ class EnsembleRSSM(common.Module):
     
         self._cell = GRUCell(self._deter, norm=True) if seq_model == "rnn" else None
         self._memory_size = transformer.pop("memory_size")
-        self._transformer = common.Transformer(d_model=hidden, **transformer) if seq_model == "transformer" else None
+        self._transformer = common.Transformer(**transformer) if seq_model == "transformer" else None
         self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
 
     def initial(self, batch_size):
@@ -55,8 +56,12 @@ class EnsembleRSSM(common.Module):
             state['deter'] = self._cell.get_initial_state(None, batch_size, dtype)
         elif self.use_transformer:
             state['deter'] = tf.zeros([batch_size, self._deter], dtype)
-            state['t_stoch'] = tf.zeros([batch_size, self._memory_size] + stoch_size, dtype)
-            state['t_action'] = tf.zeros([batch_size, self._memory_size, self._num_actions], dtype)
+            state['t_hidden'] = tf.zeros([batch_size, self._memory_size, self._hidden])
+            # state['mask'] = tf.zeros([batch_size, 1, 1, self._memory_size])
+            # state['weights'] = tf.zeros([batch_size, self._memory_size, self._memory_size])
+            # state['x'] = tf.zeros([batch_size, self._deter])
+            # state['t_stoch'] = tf.zeros([batch_size, self._memory_size] + stoch_size)
+            # state['t_action'] = tf.zeros([batch_size, self._memory_size, self._num_actions])
             # state['t_len'] = tf.zeros([batch_size, 1], dtype=tf.int32)
         return state
 
@@ -64,6 +69,7 @@ class EnsembleRSSM(common.Module):
     def use_rnn(self):
         return self._seq_model == 'rnn'
 
+    @property
     def use_transformer(self):
         return self._seq_model == 'transformer'
 
@@ -94,13 +100,13 @@ class EnsembleRSSM(common.Module):
         assert isinstance(state, dict), state
         action = swap(action)
         prior = common.static_scan(lambda prev, inputs: self.img_step(prev, inputs, training), action, state)
-        def _swap(k, v):
-            print(k, v.shape)
-            if k.startswith("t_"):
-                return swap(v)
-            else:
-                return swap(v)
-        prior = {k: _swap(k, v) for k, v in prior.items()}
+        # def _swap(k, v):
+        #     print(k, v.shape)
+        #     if k.startswith("t_"):
+        #         return swap(v)
+        #     else:
+        #         return swap(v)
+        prior = {k: swap(v) for k, v in prior.items()}
         return prior
 
     def get_feat(self, state):
@@ -108,7 +114,11 @@ class EnsembleRSSM(common.Module):
         if self._discrete:
             shape = stoch.shape[:-2] + [self._stoch * self._discrete]
             stoch = tf.reshape(stoch, shape)
-        return tf.concat([stoch, state['deter']], -1)
+        if self._exclude_deter_feat:
+            deter = tf.zeros_like(state['deter'])
+        else:
+            deter = state['deter']
+        return tf.concat([stoch, deter], -1)
 
     def get_dist(self, state, ensemble=False):
         if ensemble:
@@ -127,16 +137,24 @@ class EnsembleRSSM(common.Module):
     @tf.function
     def obs_step(self, prev_state, prev_action, embed, is_first, training, sample=True):
         # if is_first.any():
-        print(list(prev_state.keys()), flush=True)
+        # print(list(prev_state.keys()), flush=True)
         # prev_state, prev_action = tf.nest.map_structure(
         #     lambda x: tf.einsum(
-        #         'b,b...->b...', 1.0 - is_first.astype(x.dtype), x),
+        #         'b,b...->b...', (1.0 - is_first.astype(tf.float32)).astype(x.dtype), x),
         #     (prev_state, prev_action))
-        mask_fn = lambda x: tf.einsum('b,b...->b...', 1.0 - is_first.astype(x.dtype), x)
-        prev_action = mask_fn(prev_action)
-        for k in prev_state.keys():
-            # if not k.startswith('t_'):
-            prev_state[k] = mask_fn(prev_state[k])
+        # mask = is_first.astype(tf.float32).expand
+        print("is_first", is_first.shape)
+        def _mask_fn(x):
+            _mask = (1.0 - is_first.astype(tf.float32)).astype(x.dtype)
+            _shape = list(is_first.shape) + [1] * (len(x.shape) - 1)
+            return x * _mask.reshape(_shape)
+        prev_state, prev_action = tf.nest.map_structure(
+            _mask_fn, (prev_state, prev_action))
+        # mask_fn = lambda x: tf.einsum('b,b...->b...', 1.0 - is_first.astype(x.dtype), x)
+        # prev_action = mask_fn(prev_action)
+        # for k in prev_state.keys():
+        #     # if not k.startswith('t_'):
+        #     prev_state[k] = mask_fn(prev_state[k])
         prior = self.img_step(prev_state, prev_action, training, sample)
         x = tf.concat([prior['deter'], embed], -1)
         x = self.get('obs_out', tfkl.Dense, self._hidden)(x)
@@ -147,33 +165,42 @@ class EnsembleRSSM(common.Module):
         stoch = dist.sample() if sample else dist.mode()
         post = {'stoch': stoch, 'deter': prior['deter'], **stats}
         if self.use_transformer:
-            post['t_stoch'] = tf.identity(prior['t_stoch'])
-            post['t_action'] = tf.identity(prior['t_action'])
+            post['t_hidden'] = tf.stop_gradient(tf.identity(prior['t_hidden']))
+            # post['mask'] = tf.stop_gradient(tf.identity(prior['mask']))
+            # post['weights'] = tf.stop_gradient(tf.identity(prior['weights']))
+            # post['x'] = tf.stop_gradient(tf.identity(prior['x']))
+            # post['t_stoch'] = tf.identity(prior['t_stoch'])
+            # post['t_action'] = tf.identity(prior['t_action'])
             # post['t_len'] = tf.identity(prior['t_len'])
         return post, prior
 
     @tf.function
     def img_step(self, prev_state, prev_action, training, sample=True):
-        if self.use_rnn:
-            prev_stoch = self._cast(prev_state['stoch'])
-            prev_action = self._cast(prev_action)
-        elif self.use_transformer:
+        _prev_stoch = None
+        _prev_action = None
+        prev_stoch = self._cast(prev_state['stoch'])
+        prev_action = self._cast(prev_action)
+        # if self.use_transformer:
             # cur_stoch = tf.expand_dims(self._cast(prev_state['stoch']), 1)
             # cur_action = tf.expand_dims(self._cast(prev_action), 1)
 
             # pos = prev_state['t_len'] % self._memory_size  # [batch, 1]
             # print(prev_state['t_len'], type(prev_state['t_stoch']).__name__)
-            h_stoch = self._cast(tf.identity(prev_state['t_stoch']))
-            h_action = self._cast(tf.identity(prev_state['t_action']))
+            # h_stoch = self._cast(tf.identity(prev_state['t_stoch']))
+            # h_action = self._cast(tf.identity(prev_state['t_action']))
 
-            h_stoch = tf.roll(h_stoch, shift=-1, axis=1)
-            h_action = tf.roll(h_action, shift=-1, axis=1)
+            # h_stoch = tf.roll(h_stoch, shift=-1, axis=1)  # [batch, memory, stoch]
+            # h_action = tf.roll(h_action, shift=-1, axis=1)
+            
+            # h_hidden = self._cast(tf.identity(prev_state['t_hidden']))
+            # h_hidden = tf.roll(h_hidden, shift=-1, axis=1)
 
-            bs, sl = tf.shape(h_stoch)[:2]
-            indices = tf.stack([tf.range(bs), tf.ones(bs, dtype=tf.int32) * (sl - 1)], 1)
-            print(indices)
-            h_stoch = tf.tensor_scatter_nd_update(h_stoch, indices, self._cast(prev_state['stoch']))
-            h_action = tf.tensor_scatter_nd_update(h_action, indices, self._cast(prev_action))
+            # bs = tf.shape(h_stoch)[0]
+            # sl = tf.shape(h_stoch)[1]
+            # indices = tf.stack([tf.range(bs), tf.ones(bs, dtype=tf.int32) * (sl - 1)], 1)
+            # print(indices)
+            # h_stoch = tf.tensor_scatter_nd_update(h_stoch, indices, self._cast(tf.stop_gradient(prev_state['stoch'])))
+            # h_action = tf.tensor_scatter_nd_update(h_action, indices, self._cast(tf.stop_gradient(prev_action)))
             # h_stoch[:, -1].assign(self._cast(prev_state['stoch']))
             # h_action[:, -1].assign(self._cast(prev_action))
 
@@ -196,11 +223,11 @@ class EnsembleRSSM(common.Module):
             # if seq_len > self._max_memory:
             #     prev_stoch = prev_stoch[:, 1:]
             #     prev_action = prev_action[:, 1:]
-            _prev_stoch = tf.identity(h_stoch)
-            _prev_action = tf.identity(h_action)
+            # _prev_stoch = self._cast(tf.identity(h_stoch))
+            # _prev_action = self._cast(tf.identity(h_action))
 
-            prev_stoch = _prev_stoch
-            prev_action = _prev_action
+            # prev_stoch = _prev_stoch
+            # prev_action = _prev_action
 
             # print(h_stoch[0].shape, h_action[1].shape)
 
@@ -223,9 +250,20 @@ class EnsembleRSSM(common.Module):
             x, deter = self._cell(x, [deter])
             deter = deter[0]  # Keras wraps the state in a list.
         elif self.use_transformer:
-            # x: [batch_size, seq_len, hidden]
-            deter, _ = self._transformer(x, training=training)  # [batch_size, seq_len, hidden]
-            x = deter = deter[:, -1, :]  # [batch_size, hidden]
+            h_hidden = self._cast(tf.identity(prev_state['t_hidden']))
+            # h_hidden = tf.stop_gradient(tf.roll(h_hidden, shift=-1, axis=1))
+            # bs = tf.shape(h_hidden)[0]
+            # sl = tf.shape(h_hidden)[1]
+            # indices = tf.stack([tf.range(bs), tf.ones(bs, dtype=tf.int32) * (sl - 1)], 1)
+            # print(indices)
+            # h_hidden = tf.stop_gradient(tf.tensor_scatter_nd_update(h_hidden, indices, x))
+            _x = tf.identity(x)
+            h_hidden = tf.stop_gradient(tf.concat([h_hidden[:, 1:, :], tf.stop_gradient(x)[:, tf.newaxis, :]], 1))
+            out, weights, mask = self._transformer(h_hidden, training=training)  # [batch_size, seq_len, hidden]
+            out = tf.concat([out[:, -1, :], _x], -1)
+            out = self.get('transformer_out', tfkl.Dense, self._hidden)(out)
+            x = deter = self.get('transformer_out_norm', NormLayer, self._norm)(out)
+            # x = deter = h_hidden[:, -1, :]  # [batch_size, hidden]
 
         stats = self._suff_stats_ensemble(x)
         index = tf.random.uniform((), 0, self._ensemble, tf.int32)
@@ -235,8 +273,12 @@ class EnsembleRSSM(common.Module):
 
         prior = {'stoch': stoch, 'deter': deter, **stats}
         if self.use_transformer:
-            prior['t_stoch'] = _prev_stoch
-            prior['t_action'] = _prev_action
+            prior['t_hidden'] = tf.stop_gradient(h_hidden)
+            # prior['weights'] = tf.stop_gradient(weights['enc0'])
+            # prior['mask'] = tf.stop_gradient(mask)
+            # prior['x'] = tf.stop_gradient(_x)
+            # prior['t_stoch'] = tf.stop_gradient(_prev_stoch)
+            # prior['t_action'] = tf.stop_gradient(_prev_action)
             # prior['t_len'] = prev_state['t_len'] + 1
 
         return prior
@@ -486,6 +528,7 @@ class DistLayer(common.Module):
 
     def __init__(
             self, shape, dist='mse', min_std=0.1, init_std=0.0):
+        # print(shape, dist, flush=True)
         self._shape = shape
         self._dist = dist
         self._min_std = min_std
@@ -495,6 +538,7 @@ class DistLayer(common.Module):
         out = self.get('out', tfkl.Dense, np.prod(self._shape))(inputs)
         out = tf.reshape(out, tf.concat([tf.shape(inputs)[:-1], self._shape], 0))
         out = tf.cast(out, tf.float32)
+        # print("DistLayer.__call__", self._dist, flush=True)
         if self._dist in ('normal', 'tanh_normal', 'trunc_normal'):
             std = self.get('std', tfkl.Dense, np.prod(self._shape))(inputs)
             std = tf.reshape(std, tf.concat([tf.shape(inputs)[:-1], self._shape], 0))

@@ -29,6 +29,8 @@ defaults:
   log_keys_max: '^$'
   precision: 16
   jit: True
+  make_graph: False
+  benchmark: False
 
   # Agent
   clip_rewards: identity
@@ -40,13 +42,16 @@ defaults:
   # World Model
   grad_heads: [ decoder, reward, discount ]
   pred_discount: True
+  use_int_reward: False
+  int_reward_coef: 0.0002
+  int_reward_scales: { reward: 1.0, image: 1.0, discount: 0.0 }
   rssm: { seq_model: 'rnn', ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1, 
-          transformer: { num_layers: 2, num_heads: 8, memory_size: 256, pe_input: 10000, dff: 2048 } }
+          exclude_deter_feat: false, transformer: { d_model: 1024, num_layers: 1, num_heads: 8, memory_size: 256, pe_input: 10000, dff: 1024 } }
   encoder: { mlp_keys: '$^', cnn_keys: '^image$', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [ 4, 4, 4, 4 ], mlp_layers: [ 400, 400, 400, 400 ] }
   decoder: { mlp_keys: '$^', cnn_keys: '^image$', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [ 5, 5, 6, 6 ], mlp_layers: [ 400, 400, 400, 400 ] }
   reward_head: { layers: 4, units: 400, act: elu, norm: none, dist: mse }
   discount_head: { layers: 4, units: 400, act: elu, norm: none, dist: binary }
-  loss_scales: { kl: 1.0, reward: 1.0, discount: 1.0, proprio: 1.0, image: 1.0 }
+  loss_scales: { kl: 1.0, reward: 1.0, int_reward: 1.0, discount: 1.0, proprio: 1.0, image: 1.0 }
   kl: { free: 0.0, forward: False, balance: 0.8, free_avg: True }
   model_opt: { opt: adam, lr: 1e-4, eps: 1e-5, clip: 100, wd: 1e-6 }
   bootstrap_frames: 20

@@ -30,8 +30,15 @@ class Driver:
         step, episode = 0, 0
         while step < steps or episode < episodes:
             # print(f"Driver progress: step {step}, episode {episode}", flush=True)
+            def _reset_env(_env):
+                _ob = _env.reset()
+                # try:
+                #     print(_ob["ram"], flush=True)
+                # except KeyError:
+                #     pass
+                return _ob
             obs = {
-                i: self._envs[i].reset()
+                i: _reset_env(self._envs[i])
                 for i, ob in enumerate(self._obs) if ob is None or ob['is_last']}
             for i, ob in obs.items():
                 self._obs[i] = ob() if callable(ob) else ob

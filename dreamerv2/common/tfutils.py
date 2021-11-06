@@ -97,57 +97,68 @@ class Optimizer(tf.Module):
         assert loss.dtype is tf.float32, (self._name, loss.dtype)
         assert len(loss.shape) == 0, (self._name, loss.shape)
         metrics = {}
+        # return metrics
 
         # Find variables.
         modules = modules if hasattr(modules, '__len__') else (modules,)
         varibs = tf.nest.flatten([module.variables for module in modules])
+        for i, varib in enumerate(varibs):
+            print(i, varib, flush=True)
+        print("--------------------\n")
+        # print("varibs", varibs, flush=True)
         count = sum(np.prod(x.shape) for x in varibs)
         if self._once:
             print(f'Found {count} {self._name} parameters.', flush=True)
             self._once = False
         
-        print("optim 1", flush=True)
+        # print("optim 1", flush=True)
 
         # Check loss.
         tf.debugging.check_numerics(loss, self._name + '_loss')
         metrics[f'{self._name}_loss'] = loss
         
-        print("optim 2", flush=True)
+        # print("optim 2", flush=True)
 
         # Compute scaled gradient.
         if self._mixed:
             with tape:
                 loss = self._opt.get_scaled_loss(loss)
         grads = tape.gradient(loss, varibs)
+        # print("grads", grads, flush=True)
+        for i, grad in enumerate(grads):
+            if grad is None:
+                print(i, varibs[i], flush=True)
         if self._mixed:
             grads = self._opt.get_unscaled_gradients(grads)
         if self._mixed:
             metrics[f'{self._name}_loss_scale'] = self._opt.loss_scale
         
-        print("optim 3", flush=True)
+        # print("optim 3", flush=True)
 
         # Distributed sync.
         context = tf.distribute.get_replica_context()
         if context:
             grads = context.all_reduce('mean', grads)
         
-        print("optim 3", flush=True)
+        # print("optim 3", flush=True)
 
         # Gradient clipping.
         norm = tf.linalg.global_norm(grads)
+        # print("grads:")
+        # print(grads)
         if not self._mixed:
             tf.debugging.check_numerics(norm, self._name + '_norm')
         if self._clip:
             grads, _ = tf.clip_by_global_norm(grads, self._clip, norm)
         metrics[f'{self._name}_grad_norm'] = norm
         
-        print("optim 4", flush=True)
+        # print("optim 4", flush=True)
 
         # Weight decay.
         if self._wd:
             self._apply_weight_decay(varibs)
         
-        print("optim 5", flush=True)
+        # print("optim 5", flush=True)
 
         # Apply gradients.
         self._opt.apply_gradients(

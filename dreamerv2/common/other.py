@@ -5,6 +5,7 @@ import time
 
 import numpy as np
 import tensorflow as tf
+import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
 
 from . import dists
@@ -39,7 +40,7 @@ def static_scan(fn, inputs, start, reverse=False):
         inp = tf.nest.map_structure(lambda x: x[index], inputs)
         last = fn(last, inp)
         [o.append(l) for o, l in zip(outputs, tf.nest.flatten(last))]
-        print(index, len(outputs))
+        # print(index, len(outputs))
     if reverse:
         outputs = [list(reversed(x)) for x in outputs]
     # def nested_stack(x):
@@ -206,4 +207,53 @@ class CarryOverState:
 
     def __call__(self, *args):
         self._state, out = self._fn(*args, self._state)
+        print(self._state)
         return out
+
+
+
+class RunningStats:
+    
+    def __init__(self, shape, decay=0.99):
+        self._shape = shape
+        self._decay = decay
+        self.reset()
+        
+    def reset(self):
+        self._moving_mean = tf.Variable(tf.zeros(self._shape))
+        self._moving_variance = tf.Variable(tf.zeros(self._shape))
+        self._zero_debias_count = tf.Variable(0)
+        self._min = tf.Variable(tf.ones(self._shape) * 1e9)
+        self._first = True
+    
+    def push(self, x):
+        axis = tuple(range(len(x.shape) - len(self._shape)))
+        tfp.stats.assign_moving_mean_variance(
+            value=tf.stop_gradient(x), 
+            moving_mean=self._moving_mean, 
+            moving_variance=self._moving_variance,
+            zero_debias_count=self._zero_debias_count,
+            decay=self._decay,
+            axis=axis
+        )
+        self._min = tf.minimum(self._min, tf.reduce_min(x, axis=axis))
+        self._first = False
+
+    def mean(self):
+        return self._moving_mean
+    
+    def min(self):
+        return self._min
+
+    def var(self):
+        return self._moving_variance
+    
+    def std(self):
+        return tf.sqrt(self.var())
+    
+    def norm(self, x, bias=1e-8):
+        return (x - self.mean()) / (self.std() + bias)
+    
+    def half_norm(self, x, bias=1e-8):  # normalize to half normal distribution:
+        return (x - self.min()) / (self.std() + bias)
+        
