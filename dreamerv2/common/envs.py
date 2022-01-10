@@ -58,7 +58,7 @@ class GymWrapper(Wrapper):
         obs, reward, done, info = self._env.step(action)
         if not self._obs_is_dict:
             obs = {self._obs_key: obs}
-        obs['reward'] = reward
+        obs['reward'] = float(reward)
         obs['is_first'] = np.array(False, np.bool)
         obs['is_last'] = np.array(done, np.bool)
         obs['is_terminal'] = np.array(info.get('is_terminal', done), np.bool)

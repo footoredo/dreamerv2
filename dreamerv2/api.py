@@ -5,6 +5,8 @@ import pathlib
 import re
 import sys
 import warnings
+import shutil
+import random
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
@@ -20,6 +22,7 @@ import joblib
 import tensorflow as tf
 
 import agent
+import reward_trainer
 import common
 
 from common import Config
@@ -62,6 +65,8 @@ def train(env, config, outputs=None):
         common.JSONLOutput(config.logdir),
         common.TensorBoardOutput(config.logdir),
     ]
+    if config.use_wandb:
+        outputs.append(common.WanDBOutput(config.wandb_config, config))
     replay = common.Replay(logdir / 'train_episodes', seed=config.seed, **config.replay)
     step = common.Counter(replay.stats['total_steps'])
     logger = common.Logger(step, outputs, multiplier=config.action_repeat)
@@ -70,6 +75,7 @@ def train(env, config, outputs=None):
     should_train = common.Every(config.train_every)
     should_log = common.Every(config.log_every)
     should_video = common.Every(config.log_every)
+    should_save = common.Every(config.save_every)
     should_expl = common.Until(config.expl_until)
 
     def per_episode(ep):
@@ -176,6 +182,8 @@ def train(env, config, outputs=None):
                 metrics[name].clear()
             logger.add(agnt.report(next(dataset)))
             logger.write(fps=True)
+        if should_save(step):
+            agnt.save(logdir / f'variables-{step.value}.pkl')
 
     driver.on_step(train_step)
 
@@ -186,11 +194,16 @@ def train(env, config, outputs=None):
         logger.write()
         driver(policy, steps=config.eval_every)
         agnt.save(logdir / 'variables.pkl')
+        # agnt.save(logdir / f'variables-{step.value}.pkl')
+        # os.symlink(str(logdir / f'variables-{step.value}.pkl'), str(logdir / 'variables.pkl.tmp'))
+        # os.rename(str(logdir / 'variables.pkl.tmp'), str(logdir / 'variables.pkl'))  # to avoid FileExisError
     if config.benchmark:
         tf.profiler.experimental.stop()
+        
+    print("Done!")
 
 
-def replay(env, config, outputs=None):
+def replay(env, config, outputs=None, actor_mode='train'):
     os.environ['TF_DETERMINISTIC_OPS'] = 'true'
     # tf.config.set_visible_devices([], 'GPU')
     tf.random.set_seed(config.seed)
@@ -243,7 +256,7 @@ def replay(env, config, outputs=None):
     logger = common.Logger(step, outputs, multiplier=config.action_repeat)
 
     print('Create agent.', flush=True)
-    prefill_dataset = iter(prefill_replay.dataset(1, 1))
+    prefill_dataset = iter(prefill_replay.dataset(1, 5))
     # print('prefill_dataset')
     # __data = next(prefill_dataset)
     # for key, item in __data.items():
@@ -253,7 +266,13 @@ def replay(env, config, outputs=None):
     shapes = {k: v.shape[2:] for k, v in prefill_dataset.element_spec.items()}
     agnt = agent.Agent(config, logger, step, shapes)
     print('before init train', flush=True)
+    policy = lambda *args: agnt.policy(
+        *args, mode='train')
+    prefill_driver(policy, steps=1, episodes=1)
     agnt.train(next(prefill_dataset))
+    prefill_dataset = iter(prefill_replay.dataset(1, 5))
+    # agnt.policy()
+    # _, _ = agnt.report(next(prefill_dataset), True)
     # return
     print('before load', flush=True)
     agnt.load(logdir / 'variables.pkl')
@@ -261,7 +280,7 @@ def replay(env, config, outputs=None):
     print('Load variables ended', flush=True)
 
     policy = lambda *args: agnt.policy(
-        *args, mode='train')
+        *args, mode=actor_mode)
 
     try:
         env.reset_episode()
@@ -294,9 +313,9 @@ def replay(env, config, outputs=None):
     tf.profiler.experimental.stop()
     save_path = logdir / 'replay.data'
 
-    def to_numpy(torch_dict):
+    def to_numpy(tensor_dict):
         numpy_dict = dict()
-        for name, value in torch_dict.items():
+        for name, value in tensor_dict.items():
             if type(value) == dict:
                 numpy_dict[name] = to_numpy(value)
             else:
@@ -305,3 +324,37 @@ def replay(env, config, outputs=None):
 
     import joblib
     joblib.dump(to_numpy(data), save_path)
+
+    print("Done!")
+
+
+def train_reward(config, replay_dir):
+    replay_dir = pathlib.Path(replay_dir).expanduser()
+    replay = common.Replay(replay_dir, seed=config.seed, start_with_first=True, indexed_sampling=True, **config.replay)
+    trainer = reward_trainer.RewardTrainer(config)
+    dataset = iter(replay.dataset(**config.reward_pred_dataset))
+
+    for i in range(1000):
+        loss = trainer.train(next(dataset))
+        print(f"Loss at step {i}: {loss}", flush=True)
+
+
+    infos = []
+    for i in range(20):
+        data, pred, weight = trainer.test(next(dataset))
+        infos.append((data, pred, weight))
+
+    joblib.dump(infos, "infos.data")
+
+    print("Done!")
+
+    # cnt = 0
+    # while cnt < 20:
+    #     data, pred, weight = trainer.test(next(dataset))
+    #     for i in range(pred.shape[0]):
+    #         for j in range(pred.shape[1]):
+    #             if data['reward'][i, j] > 0.4:
+    #                 cnt += 1
+    #                 print(data['reward'][i, j], pred[i, j])
+    #                 print(weight['dec0'][i, :, j])
+    #                 print(weight['dec1'][i, :, j])

@@ -94,9 +94,41 @@ class JSONLOutput:
             f.write(json.dumps({'step': step, **scalars}) + '\n')
 
 
+class WanDBOutput:
+
+    def __init__(self, wandb_config, config, fps=10):
+        import wandb
+        self._run = wandb.init(**wandb_config, config=config)
+        self._fps = fps
+
+    def __call__(self, summaries):
+        import wandb
+        for step, name, value in summaries:
+            print(step, name, value.shape)
+            if len(value.shape) == 0:
+                self._run.log({'scalars/' + name: value}, step=step)
+            elif len(value.shape) == 2:
+                self._run.log({'images/' + name: wandb.Image(value, mode='L')}, step=step)
+            elif len(value.shape) == 3:
+                if value.shape[-1] == 1:
+                    self._run.log({'images/' + name: wandb.Image(value, mode='L')}, step=step)
+                elif value.shape[-1] == 3:
+                    self._run.log({'images/' + name: wandb.Image(value, mode='RGB')}, step=step)
+            elif len(value.shape) == 4:
+                self._video_summary(name, value, step)
+    
+    def _video_summary(self, name, video, step):
+        import wandb
+        name = name if isinstance(name, str) else name.decode('utf-8')
+        if np.issubdtype(video.dtype, np.floating):
+            video = np.clip(255 * video, 0, 255).astype(np.uint8)
+        video = video.transpose((0, 3, 1, 2))
+        self._run.log({'videos/' + name: wandb.Video(video, fps=self._fps)}, step=step)
+
+
 class TensorBoardOutput:
 
-    def __init__(self, logdir, fps=20, wandb_config=None):
+    def __init__(self, logdir, fps=10):
         self._logdir = pathlib.Path(logdir).expanduser()
         self._writer = None
         self._fps = fps

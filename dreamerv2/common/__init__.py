@@ -16,4 +16,4 @@ from .tfutils import *
 from .dists import *
 from .nets import *
 
-from .transformer import Transformer
+from .transformer import Transformer, TransformerNew, transformer_test

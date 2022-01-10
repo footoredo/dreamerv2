@@ -32,15 +32,18 @@ class Agent(common.Module):
         obs = tf.nest.map_structure(tf.tensor, obs)
         tf.py_function(lambda: self.step.assign(
             int(self._counter), read_value=False), [], [])
+        processed_obs = self.wm.preprocess(obs)
         if state is None:
             latent = self.wm.rssm.initial(len(obs['reward']))
+            prev_image = tf.zeros_like(processed_obs['image'])
             action = tf.zeros((len(obs['reward']), self._num_act))
-            state = latent, action
-        latent, action = state
-        embed = self.wm.encoder(self.wm.preprocess(obs))
+            state = latent, prev_image, action
+        latent, prev_image, action = state
+        embed = self.wm.encoder(processed_obs)
+        t_embed = self.wm.rssm.transformer_encode(processed_obs, tf.zeros_like(embed))
         sample = (mode == 'train') or not self.config.eval_state_mean
         latent, _ = self.wm.rssm.obs_step(
-            latent, action, embed, obs['is_first'], sample)
+            latent, prev_image, action, processed_obs['image'], embed, t_embed, obs['is_first'], sample)
         feat = self.wm.rssm.get_feat(latent)
         if mode == 'eval':
             actor = self._task_behavior.actor(feat)
@@ -54,6 +57,10 @@ class Agent(common.Module):
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
             noise = self.config.expl_noise
+        elif mode == 'random':
+            actor = self._task_behavior.actor(feat)
+            action = actor.sample()
+            noise = 1.0
         action = common.action_noise(action, noise, self.config.discrete)
 
         # mat = np.eye(17)
@@ -63,7 +70,7 @@ class Agent(common.Module):
         # action = tf.matmul(action, mat)
         
         outputs = {'action': action}
-        state = (latent, action)
+        state = (latent, processed_obs['image'], action)
         return outputs, state
 
     @tf.function(experimental_compile=False)
@@ -87,15 +94,38 @@ class Agent(common.Module):
         #     print(k, v.device)
         # return model_loss, prior
         def reward_fn(seq):
-            r = self.wm.heads['reward'](seq['feat']).mode()
+            if self.config.use_transformer_reward:
+                print("seq['feat'].shape", seq['feat'].shape, flush=True)  # [length, batch, ...]
+                dists = self.wm.heads['decoder'](seq['feat'])
+
+                imagined_obs = dict()
+                for key, dist in dists.items():
+                    imagined_obs[key] = dist.mode()
+
+                if self.wm.rssm.use_independent_transformer_encoder:
+                    _embed = self.wm.rssm.transformer_encode(imagined_obs)
+                else:
+                    _embed = self.wm.encoder(imagined_obs)
+
+                swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
+                
+                out = self.wm.rssm.calc_transformer_reward_hidden(swap(_embed), swap(seq['action']), 
+                    swap(tf.zeros_like(seq['action'])[:, :, 0]), training=True, return_weight=False)
+                r = swap(self.wm.heads['transformer_reward'](out).mode())
+            else:
+                r = self.wm.heads['reward'](seq['feat']).mode()
             if self.config.use_int_reward:
-                r += self.config.int_reward_coef * self.wm.heads['int_reward'](seq['feat']).mode()
+                for source in self.config.int_reward_sources:
+                    coef = self.config.int_reward_coef.get(source, 1.0)
+                    print(f'int reward source: {source} coef: {coef}')
+                    r += coef * self.wm.heads[f'int_reward_{source}'](seq['feat']).mode()
             return r
-        metrics.update(self._task_behavior.train(
-            self.wm, start, data['is_terminal'], reward_fn))
-        if self.config.expl_behavior != 'greedy':
-            mets = self._expl_behavior.train(start, outputs, data)[-1]
-            metrics.update({'expl_' + key: value for key, value in mets.items()})
+        if not self.config.no_behavior_training:
+            metrics.update(self._task_behavior.train(
+                self.wm, start, data['is_terminal'], reward_fn))
+            if self.config.expl_behavior != 'greedy':
+                mets = self._expl_behavior.train(start, outputs, data)[-1]
+                metrics.update({'expl_' + key: value for key, value in mets.items()})
         print("out agent train()", flush=True)
         return state, metrics
 
@@ -104,11 +134,13 @@ class Agent(common.Module):
         print(f"in report(), return_data={return_data}")
         report = {}
         data = self.wm.preprocess(data)
+        for k, v in data.items():
+            print(k, v.shape, flush=True)
         rtn = None
         for key in data:
             if re.match(self.config.decoder.cnn_keys, key):
                 name = key.replace('/', '_')
-                pred_dict = self.wm.video_pred(data, key, self._task_behavior)
+                pred_dict = self.wm.video_pred(data, key, self._task_behavior if not self.config.no_behavior_training else None)
                 report[f'openl_{name}'] = pred_dict['images']
                 if return_data:
                     # print("save pred data")
@@ -125,18 +157,37 @@ class WorldModel(common.Module):
     def __init__(self, step, shapes, num_actions, config):
         self.step = step
         self.config = config
-        self.rssm = common.EnsembleRSSM(num_actions=num_actions, **config.rssm)
         self.encoder = common.Encoder(**config.encoder)
+        self.rssm = common.EnsembleRSSM(config, encoder=None, num_actions=num_actions, **config.rssm)
+
         self.heads = {}
-        self.heads['decoder'] = common.Decoder(shapes, **config.decoder)
-        self.heads['reward'] = common.MLP([], **config.reward_head)
+
+        def add_head(_name, _module, *args, **kwargs):
+            if config.use_head_mask:
+                self.heads[_name] = common.MaskLayer(lambda: _module(*args, **kwargs), self.rssm.get_mask(_name), gradient_mask=config.head_mask.gradient)
+            else:
+                self.heads[_name] = _module(*args, **kwargs)
+
+        add_head('decoder', common.Decoder, shapes, **config.decoder)
+        # self.heads['decoder'] = common.Decoder(shapes, **config.decoder)
+        add_head('reward', common.MLP, [], **config.reward_head)
+        # self.heads['reward'] = common.MLP([], **config.reward_head)
+        self._use_transformer_reward_head = config.rssm.use_transformer_reward_head and config.rssm.use_transformer
+        if self._use_transformer_reward_head:
+            add_head('transformer_reward', common.MLP, [], **config.reward_head)
+            # self.heads['transformer_reward'] = common.MLP([], **config.reward_head)
         self._use_int_reward = config.use_int_reward
         if self._use_int_reward:
             print("use int reward!", flush=True)
-            self.heads['int_reward'] = common.MLP([], **config.reward_head)
+            self._int_reward_sources = config.int_reward_sources
+            for source in self._int_reward_sources:
+                add_head(f'int_reward_{source}', common.MLP, [], **config.reward_head)
+            # self.heads['int_reward'] = common.MLP([], **config.reward_head)
         # print("wm.reward:", self.heads['reward'].variables)
+        # self._use_attention_int_reward = config.use_attention_int_reward
         if config.pred_discount:
-            self.heads['discount'] = common.MLP([], **config.discount_head)
+            add_head('discount', common.MLP, [], **config.discount_head)
+            # self.heads['discount'] = common.MLP([], **config.discount_head)
         for name in config.grad_heads:
             assert name in self.heads, name
         self.model_opt = common.Optimizer('model', **config.model_opt)
@@ -159,14 +210,46 @@ class WorldModel(common.Module):
         print("out wm train()", flush=True)
         return state, outputs, metrics, model_loss, prior
 
+    def calc_t_importance(self, t_weight, truth_reward, pred_reward, t_pred_reward, source=None):
+        print("in calc_t_importance")
+        print("t_weight.shape", t_weight.shape)
+        print("truth_reward.shape", truth_reward.shape)
+        print("pred_reward.shape", pred_reward.shape)
+        print("t_pred_reward.shape", t_pred_reward.shape)
+
+        if source is None:
+            source = self.config.future_importance_source
+
+        t_weight = tf.identity(t_weight)  # [batch, length, num_heads, length], logits
+        t_weight = tf.nn.softmax(t_weight, axis=-1)  # [batch, length, num_heads, length], weight
+        t_weight = tf.reduce_mean(t_weight, -2)  # [batch, length, length]
+        identity = tf.eye(t_weight.shape[1])   # [length, length]
+        identity = tf.expand_dims(identity, 0) # [1, length, length]
+        t_weight = tf.multiply(1 - identity, t_weight)  # only cares attention in the past steps
+        
+        if source == 'reward':
+            item = truth_reward
+        elif source == 'abs_reward':
+            item = tf.abs(truth_reward)
+        elif source == 'reward_diff':
+            item = tf.abs(pred_reward - t_pred_reward)
+        else:
+            raise NotImplementedError
+
+        t_importance = tf.multiply(tf.expand_dims(item, -1), t_weight)  # [batch, length, length] -> pairwise importance
+
+        return t_importance
+        
+
     def loss(self, data, state=None):
         # print("in loss()", flush=True)
         data = self.preprocess(data)
         # print("1", flush=True)
         embed = self.encoder(data)
+        transformer_embed = self.rssm.transformer_encode(data, tf.zeros_like(embed))
         # print("2", flush=True)
         post, prior = self.rssm.observe(
-            embed, data['action'], data['is_first'], training=True, state=state)
+            embed, transformer_embed, data['image'], data['action'], data['is_first'], training=True, state=state, transformer_weight=True)
         # print("3", flush=True)
         kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
         assert len(kl_loss.shape) == 0
@@ -174,56 +257,124 @@ class WorldModel(common.Module):
         losses = {'kl': kl_loss}
         feat = self.rssm.get_feat(post)
         # print(feat.shape)
+        
         for name, head in self.heads.items():
-            if name == "int_reward": 
+            if name.startswith("int_reward"): 
                 continue
-            grad_head = (name in self.config.grad_heads)
-            inp = feat if grad_head else tf.stop_gradient(feat)
-            out = head(inp)
-            dists = out if isinstance(out, dict) else {name: out}
-            for key, dist in dists.items():
-                print(key, data[key].shape, dist.mean().shape)
-                like = tf.cast(dist.log_prob(data[key]), tf.float32)
-                # if not key in self._running_stats:
-                #     self._running_stats[key] = common.RunningStats(like.shape)
-                # self._running_stats[key].push(-like)
-                likes[key] = like
-                losses[key] = -like.mean()
+            if name == "transformer_reward":
+                # print("transformer_reward in loss", post['t_transformer'].shape, post['t_transformer'])
+                dist = head(post['t_transformer'])
+                t_pred_reward = tf.stop_gradient(dist.mode())
+                like = tf.cast(dist.log_prob(data["reward"]), tf.float32)
+                losses["transformer_reward"] = -like.mean()
+            else:
+                grad_head = (name in self.config.grad_heads)
+                inp = feat if grad_head else tf.stop_gradient(feat)
+                out = head(inp)
+                dists = out if isinstance(out, dict) else {name: out}
+                for key, dist in dists.items():
+                    if key == 'reward':
+                        pred_reward = tf.stop_gradient(dist.mode())
+                    # print(key, data[key].shape, dist.mean().shape)
+                    like = tf.cast(dist.log_prob(data[key]), tf.float32)
+                    # if not key in self._running_stats:
+                    #     self._running_stats[key] = common.RunningStats(like.shape)
+                    # self._running_stats[key].push(-like)
+                    likes[key] = like
+                    losses[key] = -like.mean()
         
         metrics = {}
+
+        if 't_weight_0' in post:
+            # t_weight = tf.identity(post[f't_weight_{self.rssm.transformer_num_layers - 1}'])  # [batch, length, num_heads, length], logits
+            # t_weight = tf.nn.softmax(t_weight, axis=-1)  # [batch, length, num_heads, length], weight
+            # t_weight = tf.reduce_mean(t_weight, -2)  # [batch, length, length]
+            # identity = tf.eye(t_weight.shape[1])   # [length, length]
+            # identity = tf.expand_dims(identity, 0) # [1, length, length]
+            # t_weight = tf.multiply(1 - identity, t_weight)  # only cares attention in the past steps
+            # if self.config.future_importance_source == 'reward':
+            #     source = data['reward']
+            # elif self.config.future_importance_source == 'abs_reward':
+            #     source = tf.abs(data['reward'])
+            # elif self.config.future_importance_source == 'reward_diff':
+            #     source = tf.abs(pred_reward - t_pred_reward)
+            # else:
+            #     raise NotImplementedError
+            # t_importance = tf.multiply(tf.expand_dims(source, -1), t_weight)  # [batch, length, length] -> pairwise importance
+
+            t_importance = self.calc_t_importance(post[f't_weight_{self.rssm.transformer_num_layers - 1}'], data['reward'], pred_reward, t_pred_reward)
+
         if self._use_int_reward:
-            model_like = 0
-            print("in calc int")
-            for k, v in likes.items():
-                _v = (v.mean() - v) / (v.std() + 1e-8)
-                mask = tf.cast(_v > 1, tf.float32)
-                _v = mask * _v  # only keep significant reward (> 1 std)
-                print(k, _v.shape)
-                metrics[f'{k}_like_max'] = _v.max()
-                metrics[f'{k}_like_min'] = _v.min()
-                metrics[f'{k}_like_std'] = _v.std()
-                model_like += self.config.int_reward_scales.get(k, 0.0) * _v
-            int_reward = model_like
-            data["int_reward"] = int_reward
-            inp = tf.stop_gradient(feat)
-            # inp = feat
-            dist = self.heads["int_reward"](inp)
-            like = tf.cast(dist.log_prob(int_reward), tf.float32)
-            # print("model_like", model_like.shape, inp.shape, like.shape, flush=True)
-            likes["int_reward"] = like
-            losses["int_reward"] = -like.mean()
-            metrics['int_reward_max'] = int_reward.max()
-            metrics['int_reward_min'] = int_reward.min()
-            metrics['int_reward_mean'] = int_reward.mean()
-            metrics['int_reward_std'] = int_reward.std()
+
+            def _add_int_reward_loss(_source, _int_reward):
+                key = f'int_reward_{_source}'
+                inp = tf.stop_gradient(feat)
+                dist = self.heads[key](inp)
+                like = tf.cast(dist.log_prob(_int_reward), tf.float32)
+                losses[key] = -like.mean()
+                metrics[f'{key}_max'] = _int_reward.max()
+                metrics[f'{key}_min'] = _int_reward.min()
+                metrics[f'{key}_mean'] = _int_reward.mean()
+                metrics[f'{key}_std'] = _int_reward.std()
+
+            if 'expl' in self._int_reward_sources:
+                model_like = 0
+                print("in calc int from expl")
+                for k, v in likes.items():
+                    _v = (v.mean() - v) / (v.std() + 1e-8)
+                    mask = tf.cast(_v > 1, tf.float32)
+                    _v = mask * _v  # only keep significant reward (> 1 std)
+                    print(k, _v.shape)
+                    metrics[f'{k}_like_max'] = _v.max()
+                    metrics[f'{k}_like_min'] = _v.min()
+                    metrics[f'{k}_like_std'] = _v.std()
+                    model_like += self.config.int_reward_scales.get(k, 0.0) * _v
+
+                _add_int_reward_loss('expl', model_like)
+
+            if 'attention' in self._int_reward_sources:
+                t_int_reward = tf.reduce_sum(t_importance, -2)  # [batch, length]
+
+                _add_int_reward_loss('attention', tf.stop_gradient(t_int_reward))
+
+        # if self._use_int_reward and 'expl' in self._int_reward_sources:
+        #     model_like = 0
+        #     print("in calc int from expl")
+        #     for k, v in likes.items():
+        #         _v = (v.mean() - v) / (v.std() + 1e-8)
+        #         mask = tf.cast(_v > 1, tf.float32)
+        #         _v = mask * _v  # only keep significant reward (> 1 std)
+        #         print(k, _v.shape)
+        #         metrics[f'{k}_like_max'] = _v.max()
+        #         metrics[f'{k}_like_min'] = _v.min()
+        #         metrics[f'{k}_like_std'] = _v.std()
+        #         model_like += self.config.int_reward_scales.get(k, 0.0) * _v
+        #     int_reward = model_like
+        #     # data["int_reward"] = int_reward
+        #     inp = tf.stop_gradient(feat)
+        #     # inp = feat
+        #     dist = self.heads["int_reward_expl"](inp)
+        #     like = tf.cast(dist.log_prob(int_reward), tf.float32)
+        #     # print("model_like", model_like.shape, inp.shape, like.shape, flush=True)
+        #     likes["int_reward_expl"] = like
+        #     losses["int_reward_expl"] = -like.mean()
+        #     metrics['int_reward_expl_max'] = int_reward.max()
+        #     metrics['int_reward_expl_min'] = int_reward.min()
+        #     metrics['int_reward_expl_mean'] = int_reward.mean()
+        #     metrics['int_reward_expl_std'] = int_reward.std()
+
+        # if self.rssm.use_transformer:
+        #     losses['transformer_weight_norm'] = 0
+        #     for i in range(self.rssm.transformer_num_layers):
+        #         losses['transformer_weight_norm'] += post[f't_weight_norm_{i}'].mean()
             
         model_loss = 0
-        if self._use_int_reward:
-            model_loss += losses["int_reward"]
+        # if self._use_int_reward:
+        #     model_loss += losses["int_reward"]
         # print("losses:", flush=True)
         # model_loss = tf.zeros([], dtype=tf.float32)
         for k, v in losses.items():
-            # print(k, v.shape, self.config.loss_scales.get(k, 1.0), flush=True)
+            # print(k, v.shape, v, self.config.loss_scales.get(k, 1.0), flush=True)
             model_loss += self.config.loss_scales.get(k, 1.0) * v
             
         # model_loss = sum(
@@ -235,6 +386,10 @@ class WorldModel(common.Module):
         metrics['model_kl'] = kl_value.mean()
         metrics['prior_ent'] = self.rssm.get_dist(prior).entropy().mean()
         metrics['post_ent'] = self.rssm.get_dist(post).entropy().mean()
+        # if self.rssm.use_transformer:
+        #     for i in range(self.rssm.transformer_num_layers):
+        #         metrics[f'transformer_weight_norm_{i}'] = tf.sqrt(post[f't_weight_norm_{i}']).mean()
+
         # def get_last(k, v):
         #     if k.startswith('t_'):
         #         return v[-1]
@@ -319,38 +474,58 @@ class WorldModel(common.Module):
 
     @tf.function(experimental_compile=False)
     def video_pred(self, data, key, agent=None):
+        print('data.keys()', data.keys())
         vb = self._video_pred_batches
-        bf = self._bootstrap_frames
+        bf = min(self._bootstrap_frames, data['action'].shape[1] - 1)
+        print("bootstrap_frames:", bf, data['action'].shape[1])
         decoder = self.heads['decoder']
         truth = data[key][:vb] + 0.5
         embed = self.encoder(data)
-        states, _ = self.rssm.observe(
+        transformer_embed = self.rssm.transformer_encode(data, tf.zeros_like(embed))
+        states, _prior = self.rssm.observe(
             embed[:vb, :bf], 
+            transformer_embed[:vb, :bf] if transformer_embed is not None else None,
+            data['image'][:vb, :bf],
             data['action'][:vb, :bf], 
             data['is_first'][:vb, :bf],
-            training=False
+            training=False,
+            transformer_weight=True
         )
 
         state_feat = self.rssm.get_feat(states)
+        _prior_feat = self.rssm.get_feat(_prior)
 
         recon = decoder(state_feat)[key].mode()[:vb]
         recon_reward = self.heads['reward'](state_feat).mode()[:vb]
         recon_discount = self.heads['discount'](state_feat).mode()[:vb]
+        if self._use_transformer_reward_head:
+            rcon_transformer_reward = self.heads['transformer_reward'](states['t_transformer']).mode()[:vb]
+
+        prior_recon = decoder(_prior_feat)[key].mode()[:vb]
+        prior_recon_reward = self.heads['reward'](_prior_feat).mode()[:vb]
+        prior_recon_discount = self.heads['discount'](_prior_feat).mode()[:vb]
 
         init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.rssm.imagine(data['action'][:vb, bf:], training=False, state=init)
+        prior = self.rssm.imagine(data['action'][:vb, bf:], training=False, state=init, transformer_weight=True)
 
         prior_feat = self.rssm.get_feat(prior)
 
         openl = decoder(prior_feat)[key].mode()
         openl_reward = self.heads['reward'](prior_feat).mode()[:vb]
         openl_discount = self.heads['discount'](prior_feat).mode()[:vb]
+        if self._use_transformer_reward_head:
+            if 't_transformer' in prior:
+                openl_transformer_reward = self.heads['transformer_reward'](prior['t_transformer']).mode()[:vb]
+            else:
+                openl_transformer_reward = tf.zeros_like(openl_reward)
+            model_transformer_reward = tf.concat([rcon_transformer_reward, openl_transformer_reward], 1)
 
         model_reward = tf.concat([recon_reward, openl_reward], 1)
         model_discount = tf.concat([recon_discount, openl_discount], 1)
         model = tf.concat([recon[:, :bf] + 0.5, openl + 0.5], 1)
         error = (model - truth + 1) / 2
         video = tf.concat([truth, model, error], 2)
+        prior_video = prior_recon[:, :bf] + 0.5  # [B, T, H, W, C]
         B, T, H, W, C = video.shape
 
         actions = data['action'][:vb]
@@ -361,22 +536,56 @@ class WorldModel(common.Module):
 
         ret_dict = {
             "images": video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C)),
+            "prior_images": prior_video,
             "rewards": {
                 "truth": truth_reward, 
-                "model": model_reward
+                "model": model_reward,
+                "prior": prior_recon_reward
             }, 
             "discounts": {
                 "truth": truth_discount,
-                "model": model_discount
+                "model": model_discount,
+                "prior": prior_recon_discount
             },
             "actions": actions,
             "is_first": data['is_first'][:vb],
             "feat": feat,
         }
+
+        if 'target' in data.keys():
+            truth_dir = data['target'][:bf]
+            try:
+                model_dir = decoder(feat)['target'].mode()
+                ret_dict['target'] = {
+                    'truth': truth_dir,
+                    'model': model_dir
+                }
+            except KeyError:
+                pass
+        
+        if self._use_transformer_reward_head:
+            ret_dict["rewards"]["transformer"] = model_transformer_reward
+
+        if self.config.rssm.use_transformer:
+            ret_dict["transformer_weights"] = dict()
+            for i in range(self.config.rssm.transformer.num_layers):
+                weight_recon = states[f"t_weight_{i}"]
+                try:
+                    weight_openl = prior[f"t_weight_{i}"]
+                    weight = tf.concat([weight_recon, weight_openl], 1)
+                except KeyError:
+                    weight = weight_recon
+                ret_dict["transformer_weights"][i] = weight
+
+            t_importance = self.calc_t_importance(ret_dict["transformer_weights"][self.config.rssm.transformer.num_layers - 1][:, :bf], truth_reward[:, :bf], model_reward[:, :bf], model_transformer_reward[:, :bf])
+            ret_dict["t_importance"] = t_importance
         
         if self.config.use_int_reward:
-            int_reward = self.heads['int_reward'](feat).mode()[:vb]
-            ret_dict['model_int_reward'] = int_reward
+            for k, head in self.heads.items():
+                print("head", k, flush=True)
+                if k.startswith('int_reward'):
+                    int_reward = head(feat).mode()[:vb]
+                    ret_dict[f'model_{k}'] = int_reward
 
         if agent is not None:
             recon_value = agent.critic(self.rssm.get_feat(states)).mode()[:vb]

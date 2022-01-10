@@ -15,6 +15,7 @@ defaults:
   steps: 1e8
   log_every: 1e4
   eval_every: 1e5
+  save_every: 1e7
   eval_eps: 1
   prefill: 10000
   pretrain: 1
@@ -32,30 +33,55 @@ defaults:
   make_graph: False
   benchmark: False
 
+  use_wandb: False
+  wandb_config: {
+    project: project,
+    entity: entity,
+    job_type: job_type,
+    name: name,
+    tags: [ 'tag' ]
+  }
+
   # Agent
   clip_rewards: identity
   expl_behavior: greedy
   expl_noise: 0.0
   eval_noise: 0.0
   eval_state_mean: False
+  no_behavior_training: False
 
   # World Model
   grad_heads: [ decoder, reward, discount ]
   pred_discount: True
   use_int_reward: False
-  int_reward_coef: 0.0002
+  int_reward_sources: [ expl ]
+  int_reward_coef: { expl: 0.0002, attention: 0.5 }
+  use_head_mask: False
+  head_mask: { gradient: False }
   int_reward_scales: { reward: 1.0, image: 1.0, discount: 0.0 }
-  rssm: { seq_model: 'rnn', ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1, 
-          exclude_deter_feat: false, transformer: { d_model: 1024, num_layers: 1, num_heads: 8, memory_size: 256, pe_input: 10000, dff: 1024 } }
+  use_raw_input_in_transformer: False
+  use_independent_transformer: False
+  use_independent_transformer_encoder: False
+  use_transformer_reward: False
+  include_transformer_embed: False
+  future_importance_source: reward
+  rssm: { use_transformer: False, ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1, 
+          exclude_deter_feat: False, transformer: { version: 1, d_model: 1024, num_layers: 1, num_heads: 8, memory_size: 256, pe_input: 10000, dff: 1024, 
+            no_pe: False, reverse_pe: False },
+          use_forward_loss: False, use_transformer_reward_head: False }
   encoder: { mlp_keys: '$^', cnn_keys: '^image$', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [ 4, 4, 4, 4 ], mlp_layers: [ 400, 400, 400, 400 ] }
   decoder: { mlp_keys: '$^', cnn_keys: '^image$', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [ 5, 5, 6, 6 ], mlp_layers: [ 400, 400, 400, 400 ] }
   reward_head: { layers: 4, units: 400, act: elu, norm: none, dist: mse }
   discount_head: { layers: 4, units: 400, act: elu, norm: none, dist: binary }
-  loss_scales: { kl: 1.0, reward: 1.0, int_reward: 1.0, discount: 1.0, proprio: 1.0, image: 1.0 }
+  loss_scales: { kl: 1.0, reward: 1.0, int_reward_expl: 1.0, int_reward_attention: 1.0, discount: 1.0, proprio: 1.0, image: 1.0 }
   kl: { free: 0.0, forward: False, balance: 0.8, free_avg: True }
   model_opt: { opt: adam, lr: 1e-4, eps: 1e-5, clip: 100, wd: 1e-6 }
   bootstrap_frames: 20
   video_pred_batches: 6
+
+  reward_pred: { transformer: { d_model: 256, num_layers: 2, num_heads: 4, pe_input: 10000, dff: 512 } }
+  reward_pred_opt: { opt: adam, lr: 1e-4, eps: 1e-5, clip: 100, wd: 1e-6 }
+  reward_pred_dataset: { batch: 16, length: 50 }
 
   # Actor Critic
   actor: { layers: 4, units: 400, act: elu, norm: none, dist: trunc_normal, min_std: 0.1 }
@@ -96,6 +122,7 @@ atari:
   steps: 5e7
   eval_every: 2.5e5
   log_every: 1e4
+  save_every: 5e6
   prefill: 50000
   train_every: 16
   clip_rewards: tanh
@@ -152,6 +179,32 @@ dmc:
   actor_grad: dynamics
   kl.free: 1.0
   replay.prioritize_ends: False
+
+minigrid:
+
+  render_size: [ 56, 56 ]
+  task: minigrid
+  discrete: True
+  steps: 1e6
+  eval_every: 1e4
+  log_every: 1e4
+  save_every: 2e5
+  prefill: 10000
+  train_every: 16
+  clip_rewards: tanh
+  rssm: { hidden: 200, deter: 200 }
+  decoder: { cnn_kernels: [ 4, 5, 6, 6 ] }
+  replay: { minlen: 1 }
+  actor.dist: onehot
+  model_opt.lr: 2e-4
+  actor_opt.lr: 4e-5
+  critic_opt.lr: 1e-4
+  actor_ent: 1e-3
+  discount: 0.99
+  actor_grad: reinforce
+  actor_grad_mix: 0
+  loss_scales.kl: 0.1
+  loss_scales.discount: 5.0
 
 debug:
 

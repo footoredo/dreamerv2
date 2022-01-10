@@ -53,6 +53,10 @@ class Module(tf.Module):
         amount = len(tf.nest.flatten(values))
         count = int(sum(np.prod(x.shape) for x in tf.nest.flatten(values)))
         print(f'Load checkpoint with {amount} tensors and {count} parameters.', flush=True)
+        for x in tf.nest.flatten(values):
+            print("value:", x.shape, flush=True)
+        for x in tf.nest.flatten(self.variables):
+            print("self.variables:", x.shape, flush=True)
         tf.nest.map_structure(lambda x, y: x.assign(y), self.variables, values)
 
     def get(self, name, ctor, *args, **kwargs):
@@ -125,6 +129,7 @@ class Optimizer(tf.Module):
                 loss = self._opt.get_scaled_loss(loss)
         grads = tape.gradient(loss, varibs)
         # print("grads", grads, flush=True)
+        print("None grad variables:")
         for i, grad in enumerate(grads):
             if grad is None:
                 print(i, varibs[i], flush=True)
@@ -176,3 +181,22 @@ class Optimizer(tf.Module):
                 if nontrivial:
                     print('- ' + self._name + '/' + var.name)
                 var.assign((1 - self._wd) * var)
+
+
+class MaskLayer(Module):
+
+    def __init__(self, module_fn, mask, gradient_mask=False):
+        self._module_fn = module_fn
+        self._mask = mask
+        self._n = mask.shape[0]
+        self._gradient_mask = gradient_mask
+
+    def __call__(self, _input):
+        mask = tf.reshape(self._mask, [1] * (len(_input.shape) - 1) + [self._n])
+        if not self._gradient_mask:
+            masked_input = _input * mask
+        else:
+            _through_input = _input * mask
+            _blocked_input = _input * (1 - mask)
+            masked_input = _through_input + tf.stop_gradient(_blocked_input)
+        return self.get("module", self._module_fn)(masked_input)

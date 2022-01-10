@@ -39,14 +39,14 @@ class Driver:
                 return _ob
             obs = {
                 i: _reset_env(self._envs[i])
-                for i, ob in enumerate(self._obs) if ob is None or ob['is_last']}
+                for i, ob in enumerate(self._obs) if ob is None or ob['is_last']}  # obs to reset
             for i, ob in obs.items():
                 self._obs[i] = ob() if callable(ob) else ob
                 act = {k: np.zeros(v.shape) for k, v in self._act_spaces[i].items()}
                 tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
                 self._eps[i] = [tran]
-            obs = {k: np.stack([o[k] for o in self._obs]) for k in self._obs[0]}
+            obs = {k: np.stack([o[k] for o in self._obs]) for k in self._obs[0]}  # all obs
             actions, self._state = policy(obs, self._state, **self._kwargs)
             actions = [
                 {k: np.array(actions[k][i]) for k in actions}
