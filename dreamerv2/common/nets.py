@@ -15,7 +15,7 @@ class EnsembleRSSM(common.Module):
             self, config, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
             act='elu', norm='none', std_act='softplus', min_std=0.1, exclude_deter_feat=False,
             use_transformer=False, num_actions=None, transformer=None, use_forward_loss=False,
-            use_transformer_reward_head=False, encoder=None):
+            use_transformer_reward_head=False, encoder=None, inside_transformer=None):
         super().__init__()
         self.config = config
         self._ensemble = ensemble
@@ -41,12 +41,14 @@ class EnsembleRSSM(common.Module):
     
         self._cell = GRUCell(self._deter, norm=True)
         self._memory_size = transformer.pop("memory_size")
+        self._inside_memory_size = inside_transformer.pop("memory_size")
         self._transformer_version = transformer.pop("version")
         self.transformer_num_layers = transformer["num_layers"]
         self._transformer_num_heads = transformer["num_heads"]
         self._transformer_params = transformer
         self._use_raw_input_in_transformer = config.use_raw_input_in_transformer and self.use_transformer
         self._use_independent_transformer = config.use_independent_transformer and self.use_transformer
+        self._use_inside_transformer = config.use_inside_transformer and self._use_independent_transformer
         self.use_independent_transformer_encoder = config.use_independent_transformer_encoder
         self._include_transformer_embed = config.include_transformer_embed
         if self.use_transformer:
@@ -55,6 +57,9 @@ class EnsembleRSSM(common.Module):
                 transformer.pop('no_pe')
                 transformer.pop('reverse_pe')
                 self._transformer = common.TransformerNew(output_dim=hidden, **transformer)
+
+                if self._use_inside_transformer:
+                    self._inside_transformer = common.Transformer(output_dim=hidden, no_pe=True, **inside_transformer)
             else:
                 self._transformer = common.Transformer(output_dim=hidden, **transformer)
         else:
@@ -64,7 +69,11 @@ class EnsembleRSSM(common.Module):
             if (self._use_independent_transformer and self.use_independent_transformer_encoder) or (not self._use_independent_transformer):
                 print("Transformer encoder:", encoder)
                 self._transformer_encoder = encoder or common.Encoder(**config.encoder)
+        self._importance_head = None
         self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
+
+    def set_importance_head(self, head):
+        self._importance_head = head
 
     def transformer_encode(self, data, default=None):
         if self._transformer_encoder is None:
@@ -111,6 +120,9 @@ class EnsembleRSSM(common.Module):
                     for i in range(self.transformer_num_layers):
                         state[f't_weight_{i}'] = tf.zeros([batch_size, self._transformer_num_heads, self._memory_size])
                         # state[f't_weight_norm_{i}'] = tf.zeros([batch_size, self._transformer_num_heads])
+            elif self._use_inside_transformer:
+                state['t_memory'] = tf.zeros([batch_size, self._inside_memory_size, total_stoch + self._deter])
+                state['t_importance'] = tf.zeros([batch_size, self._inside_memory_size])
         return state
 
     # @property
@@ -480,15 +492,27 @@ class EnsembleRSSM(common.Module):
             forward_x = self.get('forward_img_in_norm', NormLayer, self._norm)(forward_x)
             forward_x = self._act(forward_x)
 
-        use_transformer = self.use_transformer and not self._use_raw_input_in_transformer
+        use_transformer = self.use_transformer and (not self._use_raw_input_in_transformer or self._use_inside_transformer)
         print('use_transformer in img?', use_transformer, flush=True)
 
         if use_transformer:
-            h_hidden = self._cast(tf.identity(prev_state['t_hidden']))
-            last_token = tf.stop_gradient(tf.concat([prev_stoch, prev_state['deter']], 1))
-            h_hidden = tf.stop_gradient(tf.concat([h_hidden[:, 1:, :], last_token[:, tf.newaxis, :]], 1))
-            transformer_out, weights, mask = self._transformer(h_hidden, x, training=training)
-            transformer_out_copy = tf.identity(transformer_out)
+            if self._use_inside_transformer:
+                t_memory = self._cast(tf.identity(prev_state['t_memory']))
+                t_importance = self._cast(tf.identity(prev_state['t_importance']))
+                last_token = tf.stop_gradient(tf.concat([prev_stoch, prev_state['deter']], 1))
+                last_importance = tf.stop_gradient(self._importance_head(last_token).mode())
+                t_memory = tf.concat((t_memory, last_token[:, tf.newaxis, :]), 1)
+                t_importance = tf.concat((t_importance, last_importance[:, tf.newaxis]), 1)
+                _, indices = tf.math.top_k(t_importance, k=self._inside_memory_size)
+                t_memory = tf.stop_gradient(tf.gather(t_memory, indices, batch_dims=-1))
+                t_importance = tf.stop_gradient(tf.gather(t_importance, indices, batch_dims=-1))
+                transformer_out, weights, _ = self._inside_transformer(t_memory, x, training=training)
+            else:
+                h_hidden = self._cast(tf.identity(prev_state['t_hidden']))
+                last_token = tf.stop_gradient(tf.concat([prev_stoch, prev_state['deter']], 1))
+                h_hidden = tf.stop_gradient(tf.concat([h_hidden[:, 1:, :], last_token[:, tf.newaxis, :]], 1))
+                transformer_out, weights, mask = self._transformer(h_hidden, x, training=training)
+                transformer_out_copy = tf.identity(transformer_out)
 
         if self._transformer_version == 1:
             if use_transformer:
@@ -549,13 +573,17 @@ class EnsembleRSSM(common.Module):
             prior['forward_stoch'] = forward_stoch
 
         if use_transformer:
-            prior['t_hidden'] = tf.stop_gradient(h_hidden)
-            prior['t_transformer'] = tf.identity(transformer_out_copy)
-            print("transformer_out", transformer_out_copy.shape, transformer_out_copy)
-            if transformer_weight:
-                for i in range(self.transformer_num_layers):
-                    prior[f't_weight_{i}'] = tf.stop_gradient(weights[f'dec{i}'])
-                    print(f"prior['t_weight_{i}']", prior[f't_weight_{i}'].shape)
+            if not self._use_inside_transformer:
+                prior['t_hidden'] = tf.stop_gradient(h_hidden)
+                prior['t_transformer'] = tf.identity(transformer_out_copy)
+                print("transformer_out", transformer_out_copy.shape, transformer_out_copy)
+                if transformer_weight:
+                    for i in range(self.transformer_num_layers):
+                        prior[f't_weight_{i}'] = tf.stop_gradient(weights[f'dec{i}'])
+                        print(f"prior['t_weight_{i}']", prior[f't_weight_{i}'].shape)
+            else:
+                prior['t_memory'] = tf.stop_gradient(t_memory)
+                prior['t_importance'] = tf.stop_gradient(t_importance)
             # prior['weights'] = tf.stop_gradient(weights['enc0'])
             # prior['mask'] = tf.stop_gradient(mask)
             # prior['x'] = tf.stop_gradient(_x)

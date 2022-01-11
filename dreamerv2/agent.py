@@ -182,6 +182,8 @@ class WorldModel(common.Module):
             self._int_reward_sources = config.int_reward_sources
             for source in self._int_reward_sources:
                 add_head(f'int_reward_{source}', common.MLP, [], **config.reward_head)
+                if source == 'attention':
+                    self.rssm.set_importance_head(self.heads['int_reward_attention'])
             # self.heads['int_reward'] = common.MLP([], **config.reward_head)
         # print("wm.reward:", self.heads['reward'].variables)
         # self._use_attention_int_reward = config.use_attention_int_reward

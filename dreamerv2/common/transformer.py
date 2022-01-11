@@ -45,7 +45,7 @@ def create_look_ahead_mask(size, is_first, dtype):
         # mask = 1 - tf.reduce_max(mask * tf.cast(is_first[:, tf.newaxis, tf.newaxis], dtype), 0)
         is_first = tf.linalg.diag(tf.cast(is_first, dtype))
         mask = 1 - tf.reduce_max(tf.tensordot(is_first, mask, 1), -3)
-        mask = tf.expand_dims(mask, -3)  # for heads
+        mask = tf.expand_dims(mask, -3)  # for heads  [batch, 1, size, size]
     else:
         mask = tf.ones((size, size), dtype=dtype)
     mask = 1 - tf.linalg.band_part(mask, -1, 0)
@@ -220,7 +220,7 @@ class DecoderLayer(common.Module):
         attn_weights_block1 = None
         out1 = x[:, tf.newaxis, :]
 
-        attn2, attn_weights_block2, weights_norm2 = self.get("mha2", self._mha_fn)(enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
+        attn2, attn_weights_block2, weights_norm2, _ = self.get("mha2", self._mha_fn)(enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
         attn2 = self.get("dropout2", self._drop_fn)(attn2, training=training)
         out2 = self.get("layernorm2", self._ln_fn)(attn2 + out1)  # (batch_size, target_seq_len, d_model)
 
@@ -358,7 +358,7 @@ class Transformer(common.Module):
         output = self.get("dense3", tfkl.Dense, self._output_dim)(output)
         output = self.get("norm3", tfkl.LayerNormalization, epsilon=1e-6)(output)
 
-        return output, attention_weights, weights_norm, padding_mask
+        return output, attention_weights, weights_norm
 
 
 class DecoderLayerNew(common.Module):
@@ -434,12 +434,13 @@ class DecoderNew(common.Module):
 
 class TransformerNew(common.Module):
 
-    def __init__(self, num_layers, d_model, num_heads, dff, pe_input, output_dim, rate=0.1, dtype=None):
+    def __init__(self, num_layers, d_model, num_heads, dff, pe_input, output_dim, use_padding_mask=False, rate=0.1, dtype=None):
         super().__init__()
 
         self._dtype = dtype or prec.global_policy().compute_dtype
         self._d_model = d_model
         self._output_dim = output_dim
+        self._use_padding_mask = use_padding_mask
 
         self._dec_fn = lambda: DecoderNew(num_layers, d_model, num_heads, dff, pe_input, False, False, rate)
 
@@ -450,6 +451,9 @@ class TransformerNew(common.Module):
 
         print("x.shape", x.shape, flush=True)
         print("is_first.shape", is_first.shape, flush=True)
+
+        if self._use_padding_mask:
+            padding_mask = tf.stop_gradient(create_padding_mask(x, self._dtype))
 
         look_ahead_mask = create_look_ahead_mask(tf.shape(x)[1], is_first, self._dtype)
 
