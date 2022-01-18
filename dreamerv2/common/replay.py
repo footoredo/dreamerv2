@@ -26,6 +26,7 @@ class Replay:
         self._random = np.random.RandomState(seed)
         # filename -> key -> value_sequence
         self._complete_eps = load_episodes(self._directory, capacity, minlen)
+        self._unsaved_eps = []
         # worker -> key -> value_sequence
         self._ongoing_eps = collections.defaultdict(
             lambda: collections.defaultdict(list))
@@ -61,9 +62,23 @@ class Replay:
         self._total_episodes += 1
         self._loaded_episodes += 1
         episode = {key: convert(value) for key, value in episode.items()}
-        filename = save_episode(self._directory, episode)
+        filename = get_episode_name(episode)
         self._complete_eps[str(filename)] = episode
+        self._unsaved_eps.append(str(filename))
         self._enforce_limit()
+
+    def save_episodes(self, directory=None):
+        if directory is None:
+            directory = self._directory
+        else:
+            directory = pathlib.Path(directory).expanduser()
+            directory.mkdir(parents=True, exist_ok=True)
+        saved_files = []
+        for filename in self._unsaved_eps:
+            save_episode(directory, filename, self._complete_eps[filename])
+            saved_files.append(filename)
+        self._unsaved_eps = []
+        return saved_files
 
     def dataset(self, batch, length):
         example = next(iter(self._generate_chunks(length)))
@@ -150,17 +165,21 @@ def count_episodes(directory):
     return num_episodes, num_steps
 
 
-def save_episode(directory, episode):
+def get_episode_name(episode):
     timestamp = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
     identifier = str(uuid.uuid4().hex)
     length = eplen(episode)
-    filename = directory / f'{timestamp}-{identifier}-{length}.npz'
-    # with io.BytesIO() as f1:
-    #     np.savez_compressed(f1, **episode)
-    #     f1.seek(0)
-    #     with filename.open('wb') as f2:
-    #         f2.write(f1.read())
+    filename = f'{timestamp}-{identifier}-{length}.npz'
+    
     return filename
+
+
+def save_episode(directory, filename, episode):
+    with io.BytesIO() as f1:
+        np.savez_compressed(f1, **episode)
+        f1.seek(0)
+        with (directory / filename).open('wb') as f2:
+            f2.write(f1.read())
 
 
 def load_episodes(directory, capacity=None, minlen=1):
@@ -186,7 +205,7 @@ def load_episodes(directory, capacity=None, minlen=1):
         except Exception as e:
             print(f'Could not load episode {str(filename)}: {e}')
             continue
-        episodes[str(filename)] = episode
+        episodes[str(filename.name)] = episode
     return episodes
 
 

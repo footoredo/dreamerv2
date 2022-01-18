@@ -15,7 +15,7 @@ class EnsembleRSSM(common.Module):
             self, config, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
             act='elu', norm='none', std_act='softplus', min_std=0.1, exclude_deter_feat=False,
             use_transformer=False, num_actions=None, transformer=None, use_forward_loss=False,
-            use_transformer_reward_head=False, encoder=None, inside_transformer=None):
+            use_transformer_reward_head=False, encoder=None, raw_transformer=None, inside_transformer=None):
         super().__init__()
         self.config = config
         self._ensemble = ensemble
@@ -43,25 +43,28 @@ class EnsembleRSSM(common.Module):
         self._memory_size = transformer.pop("memory_size")
         self._inside_memory_size = inside_transformer.pop("memory_size")
         self._transformer_version = transformer.pop("version")
-        self.transformer_num_layers = transformer["num_layers"]
-        self._transformer_num_heads = transformer["num_heads"]
+        # self.transformer_num_layers = transformer["num_layers"]
+        # self._transformer_num_heads = transformer["num_heads"]
         self._transformer_params = transformer
         self._use_raw_input_in_transformer = config.use_raw_input_in_transformer and self.use_transformer
         self._use_independent_transformer = config.use_independent_transformer and self.use_transformer
+        self._use_independent_state_transformer = config.use_independent_state_transformer and self.use_transformer
         self._use_inside_transformer = config.use_inside_transformer and self._use_independent_transformer
+        self._myopic_prediction = config.myopic_prediction
         self.use_independent_transformer_encoder = config.use_independent_transformer_encoder
         self._include_transformer_embed = config.include_transformer_embed
+        self._transformer_shift = config.transformer_shift
         if self.use_transformer:
             if self._use_independent_transformer:
                 assert self._use_raw_input_in_transformer
-                transformer.pop('no_pe')
-                transformer.pop('reverse_pe')
-                self._transformer = common.TransformerNew(output_dim=hidden, **transformer)
+                self._transformer = common.TransformerNew(output_dim=hidden, **raw_transformer)
 
                 if self._use_inside_transformer:
                     self._inside_transformer = common.Transformer(output_dim=hidden, no_pe=True, **inside_transformer)
             else:
                 self._transformer = common.Transformer(output_dim=hidden, **transformer)
+            if self._use_independent_state_transformer:
+                self._state_transformer = common.TransformerNew(output_dim=hidden, **raw_transformer)
         else:
             self._transformer = None
         self._transformer_encoder = None
@@ -99,6 +102,8 @@ class EnsembleRSSM(common.Module):
         state['deter'] = self._cell.get_initial_state(None, batch_size, dtype)
         if self._use_forward_loss:
             state['forward_stoch'] = tf.zeros([batch_size] + stoch_size, dtype)
+        if self._myopic_prediction:
+            state['myopic_out'] = tf.zeros([batch_size, self._hidden], dtype)
         if self.use_transformer:
             # state['deter'] = tf.zeros([batch_size, self._deter], dtype)
             if not self._use_independent_transformer:
@@ -117,8 +122,8 @@ class EnsembleRSSM(common.Module):
                 # state['t_action'] = tf.zeros([batch_size, self._memory_size, self._num_actions])
                 # state['t_len'] = tf.zeros([batch_size, 1], dtype=tf.int32)
                 if transformer_weight:
-                    for i in range(self.transformer_num_layers):
-                        state[f't_weight_{i}'] = tf.zeros([batch_size, self._transformer_num_heads, self._memory_size])
+                    for i in range(self._transformer.num_layers):
+                        state[f't_weight_{i}'] = tf.zeros([batch_size, self._transformer.num_heads, self._memory_size])
                         # state[f't_weight_norm_{i}'] = tf.zeros([batch_size, self._transformer_num_heads])
             elif self._use_inside_transformer:
                 state['t_memory'] = tf.zeros([batch_size, self._inside_memory_size, total_stoch + self._deter])
@@ -133,19 +138,28 @@ class EnsembleRSSM(common.Module):
     # def use_transformer(self):
     #     return self._seq_model == 'transformer'
 
-    def calc_transformer_reward_hidden(self, embed, action, is_first, training, return_weight=False):
-        print("in calc_transformer_reward_hidden()")
-        print("embed.shape", embed.shape, flush=True)
+    def calc_independent_transformer_hidden(self, embed, action, is_first, training, transformer=None, transformer_shift=None, return_weight=False):
+        print("in calc_independent_transformer_hidden()")
+        print("embed.shape", embed.shape, flush=True)  # [batch, length, embed]
         print("action.shape", action.shape, flush=True)
         print("is_first.shape", is_first.shape, flush=True)
-        x = tf.concat([embed, action], -1)
-        out, weight = self._transformer(x, is_first, training)
+        if transformer is None:
+            transformer = self._transformer
+        if transformer_shift is None:
+            transformer_shift = self._transformer_shift
+        if transformer_shift:
+            shifted_embed = tf.concat([tf.zeros_like(embed[:, :1, :]), embed[:, :-1, :]], 1)
+            x = tf.concat([shifted_embed, action], -1)
+        else:
+            x = tf.concat([embed, action], -1)
+        out, weight = transformer(x, is_first, training)
         print("out.shape", out.shape, flush=True)
         if return_weight:
             return out, weight
         else:
             return out
 
+    # state[i - 1] + action[i] => state[i]
     @tf.function
     def observe(self, embed, transformer_embed, image, action, is_first, training, state=None, transformer_weight=False):
         swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
@@ -185,11 +199,11 @@ class EnsembleRSSM(common.Module):
                 print("embed.shape", embed.shape, flush=True)
                 _embed = embed
                 
-            out, weight = self.calc_transformer_reward_hidden(_embed, action, is_first, training, return_weight=True)
+            out, weight = self.calc_independent_transformer_hidden(_embed, action, is_first, training, return_weight=True)
 
             t_states = dict()
             t_states['t_transformer'] = out
-            for i in range(self.transformer_num_layers):
+            for i in range(self._transformer.num_layers):
                 t_states[f't_weight_{i}'] = weight[f'dec{i}'].transpose([0, 2, 1, 3])
                 print(f't_weight_{i}.shape', t_states[f't_weight_{i}'].shape, flush=True)  # [batch, length, head, length]
 
@@ -210,6 +224,19 @@ class EnsembleRSSM(common.Module):
         if self._use_independent_transformer:
             post.update(t_states)
 
+        if self._use_independent_state_transformer:
+            _embed = tf.stop_gradient(post['stoch'])
+            out, weight = self.calc_independent_transformer_hidden(_embed, action, is_first, training, transformer=self._state_transformer, transformer_shift=True, return_weight=True)
+            x = self.get('state_transformer_out', tfkl.Dense, self._hidden)(out)
+            x = self.get('state_transformer_out_norm', NormLayer, self._norm)(x)
+            x = self._act(x)
+            state_transformer_stats = self._suff_stats_layer('state_transformer_dist', x)
+            
+            for i in range(self._state_transformer.num_layers):
+                post[f'state_t_weight_{i}'] = weight[f'dec{i}'].transpose([0, 2, 1, 3])
+        else:
+            state_transformer_stats = None
+
         print("Post:")
         for k, v in post.items():
             print(k, v.shape, flush=True)
@@ -217,7 +244,7 @@ class EnsembleRSSM(common.Module):
         for k, v in prior.items():
             print(k, v.shape, flush=True)
 
-        return post, prior
+        return post, prior, state_transformer_stats
 
     @tf.function
     def imagine(self, action, training, state=None, transformer_weight=False):
@@ -279,6 +306,8 @@ class EnsembleRSSM(common.Module):
             stoch_mask = create_stoch_mask(self._stoch)
         elif name == 'transformer_reward':
             return self._cast(tf.ones(self._deter))
+        elif name == 'myopic_reward':
+            return self._cast(tf.ones(self._hidden))
         else:
             raise NotImplementedError
         mask = tf.concat((stoch_mask, tf.ones(self._deter)), 0)
@@ -387,6 +416,11 @@ class EnsembleRSSM(common.Module):
         dist = self.get_dist(stats)
         stoch = dist.sample() if sample else dist.mode()
         post = {'stoch': stoch, 'deter': prior['deter'], **stats}
+        if self._use_inside_transformer:
+            post['t_memory'] = prior['t_memory']
+            post['t_importance'] = prior['t_importance']
+        if self._myopic_prediction:
+            post['myopic_out'] = prior['myopic_out']
         if self.use_transformer and not self._use_independent_transformer:
             if self._use_raw_input_in_transformer:
                 post['t_hidden'] = tf.identity(h_hidden)
@@ -398,7 +432,7 @@ class EnsembleRSSM(common.Module):
                 post['t_hidden'] = tf.stop_gradient(tf.identity(prior['t_hidden']))
                 post['t_transformer'] = tf.identity(prior['t_transformer'])
             if transformer_weight:
-                for i in range(self.transformer_num_layers):
+                for i in range(self._transformer.num_layers):
                     if self._use_raw_input_in_transformer:
                         post[f't_weight_{i}'] = tf.stop_gradient(weights[f'dec{i}'])
                         post[f't_weight_norm_{i}'] = tf.stop_gradient(weights_norm[f'dec{i}'])
@@ -492,6 +526,12 @@ class EnsembleRSSM(common.Module):
             forward_x = self.get('forward_img_in_norm', NormLayer, self._norm)(forward_x)
             forward_x = self._act(forward_x)
 
+        if self._myopic_prediction:
+            myopic_out = tf.concat([prev_stoch, prev_action], -1)
+            myopic_out = self.get('myopic_out', tfkl.Dense, self._hidden)(myopic_out)
+            myopic_out = self.get('myopic_out_norm', NormLayer, self._norm)(myopic_out)
+            myopic_out = self._act(myopic_out)
+
         use_transformer = self.use_transformer and (not self._use_raw_input_in_transformer or self._use_inside_transformer)
         print('use_transformer in img?', use_transformer, flush=True)
 
@@ -499,13 +539,15 @@ class EnsembleRSSM(common.Module):
             if self._use_inside_transformer:
                 t_memory = self._cast(tf.identity(prev_state['t_memory']))
                 t_importance = self._cast(tf.identity(prev_state['t_importance']))
-                last_token = tf.stop_gradient(tf.concat([prev_stoch, prev_state['deter']], 1))
+                # last_token = tf.stop_gradient(tf.concat([prev_stoch, prev_state['deter']], 1))
+                last_token = tf.concat([prev_stoch, prev_state['deter']], 1)
                 last_importance = tf.stop_gradient(self._importance_head(last_token).mode())
                 t_memory = tf.concat((t_memory, last_token[:, tf.newaxis, :]), 1)
                 t_importance = tf.concat((t_importance, last_importance[:, tf.newaxis]), 1)
                 _, indices = tf.math.top_k(t_importance, k=self._inside_memory_size)
-                t_memory = tf.stop_gradient(tf.gather(t_memory, indices, batch_dims=-1))
-                t_importance = tf.stop_gradient(tf.gather(t_importance, indices, batch_dims=-1))
+                # t_memory = tf.stop_gradient(tf.gather(t_memory, indices, axis=1, batch_dims=1))
+                t_memory = tf.gather(t_memory, indices, axis=1, batch_dims=1)
+                t_importance = tf.stop_gradient(tf.gather(t_importance, indices, axis=1, batch_dims=1))
                 transformer_out, weights, _ = self._inside_transformer(t_memory, x, training=training)
             else:
                 h_hidden = self._cast(tf.identity(prev_state['t_hidden']))
@@ -572,17 +614,21 @@ class EnsembleRSSM(common.Module):
 
             prior['forward_stoch'] = forward_stoch
 
+        if self._myopic_prediction:
+            prior['myopic_out'] = myopic_out
+
         if use_transformer:
             if not self._use_inside_transformer:
                 prior['t_hidden'] = tf.stop_gradient(h_hidden)
                 prior['t_transformer'] = tf.identity(transformer_out_copy)
                 print("transformer_out", transformer_out_copy.shape, transformer_out_copy)
                 if transformer_weight:
-                    for i in range(self.transformer_num_layers):
+                    for i in range(self._transformer.num_layers):
                         prior[f't_weight_{i}'] = tf.stop_gradient(weights[f'dec{i}'])
                         print(f"prior['t_weight_{i}']", prior[f't_weight_{i}'].shape)
             else:
-                prior['t_memory'] = tf.stop_gradient(t_memory)
+                # prior['t_memory'] = tf.stop_gradient(t_memory)
+                prior['t_memory'] = t_memory
                 prior['t_importance'] = tf.stop_gradient(t_importance)
             # prior['weights'] = tf.stop_gradient(weights['enc0'])
             # prior['mask'] = tf.stop_gradient(mask)

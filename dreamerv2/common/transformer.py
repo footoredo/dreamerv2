@@ -26,7 +26,7 @@ def positional_encoding(position, d_model):
 
     return pos_encoding
 
-def create_look_ahead_mask(size, is_first, dtype):
+def create_look_ahead_mask(size, is_first, attend_to_self, dtype):
     if is_first is not None:
         # masks = []
         # for i in range(size):
@@ -49,6 +49,8 @@ def create_look_ahead_mask(size, is_first, dtype):
     else:
         mask = tf.ones((size, size), dtype=dtype)
     mask = 1 - tf.linalg.band_part(mask, -1, 0)
+    if not attend_to_self:
+        mask = mask + tf.eye(size)
     return tf.stop_gradient(mask)  # (seq_len, seq_len)
 
 
@@ -336,22 +338,31 @@ class TransformerOld(common.Module):
 
 
 class Transformer(common.Module):
-    def __init__(self, num_layers, d_model, num_heads, dff, pe_input, output_dim, no_pe=False, reverse_pe=False, rate=0.1, dtype=None):
+    def __init__(self, num_layers, d_model, num_heads, dff, pe_input, output_dim, no_pe=False, reverse_pe=False, input_dense=True, rate=0.1, dtype=None):
         super().__init__()
         self._dtype = dtype or prec.global_policy().compute_dtype
         self._d_model = d_model
         self._output_dim = output_dim
+        self._input_dense = input_dense
+
+        self.num_layers = num_layers
+        self.num_heads = num_heads
 
         self._dec_fn = lambda: Decoder(num_layers, d_model, num_heads, dff, pe_input, no_pe, reverse_pe, rate)
 
     @tf.function
     def __call__(self, inp, ctx, training):
         padding_mask = tf.stop_gradient(create_padding_mask(inp, self._dtype))
-        x = self.get("dense1", tfkl.Dense, self._d_model, activation='relu')(inp)
-        # x = self.get("norm1", tfkl.LayerNormalization, epsilon=1e-6)(x)
 
-        y = self.get("dense2", tfkl.Dense, self._d_model, activation='relu')(ctx)
-        # y = self.get("norm2", tfkl.LayerNormalization, epsilon=1e-6)(y)
+        if self._input_dense:
+            x = self.get("dense1", tfkl.Dense, self._d_model, activation='relu')(inp)
+            # x = self.get("norm1", tfkl.LayerNormalization, epsilon=1e-6)(x)
+
+            y = self.get("dense2", tfkl.Dense, self._d_model, activation='relu')(ctx)
+            # y = self.get("norm2", tfkl.LayerNormalization, epsilon=1e-6)(y)
+        else:
+            x = inp
+            y = ctx
 
         output, attention_weights, weights_norm = self.get("decoder", self._dec_fn)(y, x, training, padding_mask)  # (batch_size, inp_seq_len, d_model)
 
@@ -373,7 +384,6 @@ class DecoderLayerNew(common.Module):
     @tf.function
     def __call__(self, x, training, look_ahead_mask):
         # x.shape == (batch_size, target_seq_len, d_model)
-        # enc_output.shape == (batch_size, input_seq_len, d_model)
 
         attn1, attn_weights_block1, _, past_info = self.get("mha1", self._mha_fn)(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
         attn1 = self.get("dropout1", self._drop_fn)(attn1, training=training)
@@ -392,7 +402,7 @@ class DecoderLayerNew(common.Module):
 
 class DecoderNew(common.Module):
     def __init__(self, num_layers, d_model, num_heads, dff,
-                maximum_position_encoding, no_pe=False, reverse_pe=False, rate=0.1, dtype=None):
+                maximum_position_encoding, no_pe=False, reverse_pe=False, last_layer_one_head=False, rate=0.1, dtype=None):
         super().__init__()
         self._d_model = d_model
         self._num_layers = num_layers
@@ -401,8 +411,10 @@ class DecoderNew(common.Module):
         self._pe = positional_encoding(maximum_position_encoding, d_model)
         self._no_pe = no_pe
         self._reverse_pe = reverse_pe
+        self._num_heads = num_heads
+        self._last_layer_one_head = last_layer_one_head
 
-        self._dec_fn = lambda: DecoderLayerNew(d_model, num_heads, dff, rate)
+        self._dec_fn = lambda nh: DecoderLayerNew(d_model, nh, dff, rate)
         self._drop_fn = lambda: tfkl.Dropout(rate)
 
     @tf.function
@@ -424,7 +436,10 @@ class DecoderNew(common.Module):
         attention_weights = dict()
 
         for i in range(self._num_layers):
-            x, w, _ = self.get(f"dec{i}", self._dec_fn)(x, training, look_ahead_mask)
+            num_heads = self._num_heads
+            if self._last_layer_one_head and i == self._num_layers - 1:
+                num_heads = 1
+            x, w, _ = self.get(f"dec{i}", self._dec_fn, num_heads)(x, training, look_ahead_mask)
             print(i, "w", w.shape)
             attention_weights[f"dec{i}"] = tf.stop_gradient(w)
             # weights_norm[f"dec{i}"] = tf.stop_gradient(n2)
@@ -434,15 +449,18 @@ class DecoderNew(common.Module):
 
 class TransformerNew(common.Module):
 
-    def __init__(self, num_layers, d_model, num_heads, dff, pe_input, output_dim, use_padding_mask=False, rate=0.1, dtype=None):
+    def __init__(self, num_layers, d_model, num_heads, dff, pe_input, output_dim, attend_to_self=True, last_layer_one_head=False, rate=0.1, dtype=None):
         super().__init__()
 
         self._dtype = dtype or prec.global_policy().compute_dtype
         self._d_model = d_model
         self._output_dim = output_dim
-        self._use_padding_mask = use_padding_mask
+        self._attend_to_self = attend_to_self
 
-        self._dec_fn = lambda: DecoderNew(num_layers, d_model, num_heads, dff, pe_input, False, False, rate)
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+
+        self._dec_fn = lambda: DecoderNew(num_layers, d_model, num_heads, dff, pe_input, False, False, last_layer_one_head, rate)
 
     @tf.function
     def __call__(self, x, is_first, training):
@@ -452,10 +470,7 @@ class TransformerNew(common.Module):
         print("x.shape", x.shape, flush=True)
         print("is_first.shape", is_first.shape, flush=True)
 
-        if self._use_padding_mask:
-            padding_mask = tf.stop_gradient(create_padding_mask(x, self._dtype))
-
-        look_ahead_mask = create_look_ahead_mask(tf.shape(x)[1], is_first, self._dtype)
+        look_ahead_mask = create_look_ahead_mask(tf.shape(x)[1], is_first, self._attend_to_self, self._dtype)
 
         dec_output, attention_weights = self.get('decoder', self._dec_fn)(x, training, look_ahead_mask)
         print('dec_output', dec_output.shape, flush=True)

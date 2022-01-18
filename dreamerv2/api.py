@@ -193,7 +193,13 @@ def train(env, config, outputs=None):
         print("step", step.value)
         logger.write()
         driver(policy, steps=config.eval_every)
-        agnt.save(logdir / 'variables.pkl')
+        agnt.save(logdir / 'tmp_variables.pkl')
+        if config.save_episodes:
+            saved_files = replay.save_episodes(logdir / "tmp_train_episodes")
+            for filename in saved_files:
+                os.rename(logdir / "tmp_train_episodes" / filename, logdir / "train_episodes" / filename)
+        os.rename(logdir / 'tmp_variables.pkl', logdir / 'variables.pkl')
+
         # agnt.save(logdir / f'variables-{step.value}.pkl')
         # os.symlink(str(logdir / f'variables-{step.value}.pkl'), str(logdir / 'variables.pkl.tmp'))
         # os.rename(str(logdir / 'variables.pkl.tmp'), str(logdir / 'variables.pkl'))  # to avoid FileExisError
@@ -204,7 +210,7 @@ def train(env, config, outputs=None):
 
 
 def replay(env, config, outputs=None, actor_mode='train'):
-    os.environ['TF_DETERMINISTIC_OPS'] = 'true'
+    # os.environ['TF_DETERMINISTIC_OPS'] = 'true'
     # tf.config.set_visible_devices([], 'GPU')
     tf.random.set_seed(config.seed)
     logdir = pathlib.Path(config.logdir).expanduser()

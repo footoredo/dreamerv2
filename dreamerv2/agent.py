@@ -109,7 +109,7 @@ class Agent(common.Module):
 
                 swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
                 
-                out = self.wm.rssm.calc_transformer_reward_hidden(swap(_embed), swap(seq['action']), 
+                out = self.wm.rssm.calc_independent_transformer_hidden(swap(_embed), swap(seq['action']), 
                     swap(tf.zeros_like(seq['action'])[:, :, 0]), training=True, return_weight=False)
                 r = swap(self.wm.heads['transformer_reward'](out).mode())
             else:
@@ -176,6 +176,9 @@ class WorldModel(common.Module):
         if self._use_transformer_reward_head:
             add_head('transformer_reward', common.MLP, [], **config.reward_head)
             # self.heads['transformer_reward'] = common.MLP([], **config.reward_head)
+        self._myopic_prediction = config.myopic_prediction
+        if self._myopic_prediction:
+            add_head('myopic_reward', common.MLP, [], **config.reward_head)
         self._use_int_reward = config.use_int_reward
         if self._use_int_reward:
             print("use int reward!", flush=True)
@@ -212,7 +215,7 @@ class WorldModel(common.Module):
         print("out wm train()", flush=True)
         return state, outputs, metrics, model_loss, prior
 
-    def calc_t_importance(self, t_weight, truth_reward, pred_reward, t_pred_reward, source=None):
+    def calc_t_importance(self, t_weight, truth_reward, pred_reward, t_pred_reward, myopic_pred_reward=None, source=None, reduction=None):
         print("in calc_t_importance")
         print("t_weight.shape", t_weight.shape)
         print("truth_reward.shape", truth_reward.shape)
@@ -222,9 +225,17 @@ class WorldModel(common.Module):
         if source is None:
             source = self.config.future_importance_source
 
+        if reduction is None:
+            reduction = self.config.future_importance_reduction
+
         t_weight = tf.identity(t_weight)  # [batch, length, num_heads, length], logits
         t_weight = tf.nn.softmax(t_weight, axis=-1)  # [batch, length, num_heads, length], weight
-        t_weight = tf.reduce_mean(t_weight, -2)  # [batch, length, length]
+        if reduction == 'mean':
+            t_weight = tf.reduce_mean(t_weight, -2)  # [batch, length, length]
+        elif reduction == 'max':
+            t_weight = tf.reduce_max(t_weight, -2)  # [batch, length, length]
+        else:
+            raise NotImplementedError
         identity = tf.eye(t_weight.shape[1])   # [length, length]
         identity = tf.expand_dims(identity, 0) # [1, length, length]
         t_weight = tf.multiply(1 - identity, t_weight)  # only cares attention in the past steps
@@ -235,6 +246,8 @@ class WorldModel(common.Module):
             item = tf.abs(truth_reward)
         elif source == 'reward_diff':
             item = tf.abs(pred_reward - t_pred_reward)
+        elif source == 'reward_diff_myopic':
+            item = tf.abs(myopic_pred_reward - t_pred_reward)
         else:
             raise NotImplementedError
 
@@ -250,15 +263,20 @@ class WorldModel(common.Module):
         embed = self.encoder(data)
         transformer_embed = self.rssm.transformer_encode(data, tf.zeros_like(embed))
         # print("2", flush=True)
-        post, prior = self.rssm.observe(
+        post, prior, state_transformer_stats = self.rssm.observe(
             embed, transformer_embed, data['image'], data['action'], data['is_first'], training=True, state=state, transformer_weight=True)
         # print("3", flush=True)
         kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
         assert len(kl_loss.shape) == 0
         likes = {}
         losses = {'kl': kl_loss}
+        if state_transformer_stats is not None:
+            state_transformer_kl_loss, state_transformer_kl_value = self.rssm.kl_loss(post, state_transformer_stats, forward=False, balance=1.0, free=0.0, free_avg=True)
+            losses["state_transformer_kl"] = state_transformer_kl_loss
         feat = self.rssm.get_feat(post)
         # print(feat.shape)
+
+        myopic_pred_reward = None
         
         for name, head in self.heads.items():
             if name.startswith("int_reward"): 
@@ -269,6 +287,11 @@ class WorldModel(common.Module):
                 t_pred_reward = tf.stop_gradient(dist.mode())
                 like = tf.cast(dist.log_prob(data["reward"]), tf.float32)
                 losses["transformer_reward"] = -like.mean()
+            elif name == 'myopic_reward':
+                dist = head(post['myopic_out'])
+                myopic_pred_reward = tf.stop_gradient(dist.mode())
+                like = tf.cast(dist.log_prob(data["reward"]), tf.float32)
+                losses["myopic_reward"] = -like.mean()
             else:
                 grad_head = (name in self.config.grad_heads)
                 inp = feat if grad_head else tf.stop_gradient(feat)
@@ -304,7 +327,7 @@ class WorldModel(common.Module):
             #     raise NotImplementedError
             # t_importance = tf.multiply(tf.expand_dims(source, -1), t_weight)  # [batch, length, length] -> pairwise importance
 
-            t_importance = self.calc_t_importance(post[f't_weight_{self.rssm.transformer_num_layers - 1}'], data['reward'], pred_reward, t_pred_reward)
+            t_importance = self.calc_t_importance(post[f't_weight_{self.rssm.transformer_num_layers - 1}'], data['reward'], pred_reward, t_pred_reward, myopic_pred_reward)
 
         if self._use_int_reward:
 
@@ -386,6 +409,8 @@ class WorldModel(common.Module):
             prior=prior, likes=likes, kl=kl_value)
         metrics.update({f'{name}_loss': value for name, value in losses.items()})
         metrics['model_kl'] = kl_value.mean()
+        if state_transformer_stats is not None:
+            metrics['state_transformer_kl_value'] = state_transformer_kl_value.mean()
         metrics['prior_ent'] = self.rssm.get_dist(prior).entropy().mean()
         metrics['post_ent'] = self.rssm.get_dist(post).entropy().mean()
         # if self.rssm.use_transformer:
@@ -484,7 +509,7 @@ class WorldModel(common.Module):
         truth = data[key][:vb] + 0.5
         embed = self.encoder(data)
         transformer_embed = self.rssm.transformer_encode(data, tf.zeros_like(embed))
-        states, _prior = self.rssm.observe(
+        states, _prior, _ = self.rssm.observe(
             embed[:vb, :bf], 
             transformer_embed[:vb, :bf] if transformer_embed is not None else None,
             data['image'][:vb, :bf],
@@ -501,7 +526,9 @@ class WorldModel(common.Module):
         recon_reward = self.heads['reward'](state_feat).mode()[:vb]
         recon_discount = self.heads['discount'](state_feat).mode()[:vb]
         if self._use_transformer_reward_head:
-            rcon_transformer_reward = self.heads['transformer_reward'](states['t_transformer']).mode()[:vb]
+            recon_transformer_reward = self.heads['transformer_reward'](states['t_transformer']).mode()[:vb]
+        if self._myopic_prediction:
+            recon_myopic_reward = self.heads['myopic_reward'](states['myopic_out']).mode()[:vb]
 
         prior_recon = decoder(_prior_feat)[key].mode()[:vb]
         prior_recon_reward = self.heads['reward'](_prior_feat).mode()[:vb]
@@ -520,7 +547,12 @@ class WorldModel(common.Module):
                 openl_transformer_reward = self.heads['transformer_reward'](prior['t_transformer']).mode()[:vb]
             else:
                 openl_transformer_reward = tf.zeros_like(openl_reward)
-            model_transformer_reward = tf.concat([rcon_transformer_reward, openl_transformer_reward], 1)
+            model_transformer_reward = tf.concat([recon_transformer_reward, openl_transformer_reward], 1)
+        if self._myopic_prediction:
+            openl_myopic_reward = self.heads['myopic_reward'](prior['myopic_out']).mode()[:vb]
+            model_myopic_reward = tf.concat([recon_myopic_reward, openl_myopic_reward], 1)
+        else:
+            model_myopic_reward = None
 
         model_reward = tf.concat([recon_reward, openl_reward], 1)
         model_discount = tf.concat([recon_discount, openl_discount], 1)
@@ -568,6 +600,9 @@ class WorldModel(common.Module):
         if self._use_transformer_reward_head:
             ret_dict["rewards"]["transformer"] = model_transformer_reward
 
+        if self._myopic_prediction:
+            ret_dict["rewards"]["myopic"] = model_myopic_reward
+
         if self.config.rssm.use_transformer:
             ret_dict["transformer_weights"] = dict()
             for i in range(self.config.rssm.transformer.num_layers):
@@ -579,8 +614,15 @@ class WorldModel(common.Module):
                     weight = weight_recon
                 ret_dict["transformer_weights"][i] = weight
 
-            t_importance = self.calc_t_importance(ret_dict["transformer_weights"][self.config.rssm.transformer.num_layers - 1][:, :bf], truth_reward[:, :bf], model_reward[:, :bf], model_transformer_reward[:, :bf])
+            t_importance = self.calc_t_importance(ret_dict["transformer_weights"][self.config.rssm.transformer.num_layers - 1][:, :bf], 
+                truth_reward[:, :bf], model_reward[:, :bf], model_transformer_reward[:, :bf], model_myopic_reward[:, :bf] if model_myopic_reward is not None else None)
             ret_dict["t_importance"] = t_importance
+
+            if self.config.use_inside_transformer:
+                memory_importance_recon = states["t_importance"]
+                memory_importance_openl = prior["t_importance"]
+                memory_importance = tf.concat([memory_importance_recon, memory_importance_openl], 1)
+                ret_dict["memory_importance"] = memory_importance
         
         if self.config.use_int_reward:
             for k, head in self.heads.items():
