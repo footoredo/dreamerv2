@@ -173,7 +173,7 @@ class EnsembleRSSM(common.Module):
         if self._use_independent_transformer:
             _state = dict()
             for k, v in state.items():
-                if k != 't_transformer' and not k.startswith('t_weight_'):
+                if k != 't_transformer' and not k.startswith('t_weight_') and not k.startswith('t_state_weight_'):
                     _state[k] = v
             state = _state
             # try:
@@ -211,10 +211,10 @@ class EnsembleRSSM(common.Module):
             lambda prev, inputs: self.obs_step(prev[0], *inputs, training=training, transformer_weight=transformer_weight),
             (swap(prev_image), swap(action), swap(image), swap(embed), swap(transformer_embed), swap(is_first)), (state, state))
 
-        print("Post:")
+        print("Post 1:")
         for k, v in post.items():
             print(k, v.shape, flush=True)
-        print("Prior:")
+        print("Prior 1:")
         for k, v in prior.items():
             print(k, v.shape, flush=True)
 
@@ -226,6 +226,9 @@ class EnsembleRSSM(common.Module):
 
         if self._use_independent_state_transformer:
             _embed = tf.stop_gradient(post['stoch'])
+            if self._discrete:
+                shape = _embed.shape[:-2] + [self._stoch * self._discrete]
+                _embed = tf.reshape(_embed, shape)
             out, weight = self.calc_independent_transformer_hidden(_embed, action, is_first, training, transformer=self._state_transformer, transformer_shift=True, return_weight=True)
             x = self.get('state_transformer_out', tfkl.Dense, self._hidden)(out)
             x = self.get('state_transformer_out_norm', NormLayer, self._norm)(x)
@@ -233,14 +236,14 @@ class EnsembleRSSM(common.Module):
             state_transformer_stats = self._suff_stats_layer('state_transformer_dist', x)
             
             for i in range(self._state_transformer.num_layers):
-                post[f'state_t_weight_{i}'] = weight[f'dec{i}'].transpose([0, 2, 1, 3])
+                post[f't_state_weight_{i}'] = weight[f'dec{i}'].transpose([0, 2, 1, 3])
         else:
             state_transformer_stats = None
 
-        print("Post:")
+        print("Post 2:")
         for k, v in post.items():
             print(k, v.shape, flush=True)
-        print("Prior:")
+        print("Prior 2:")
         for k, v in prior.items():
             print(k, v.shape, flush=True)
 
@@ -255,7 +258,7 @@ class EnsembleRSSM(common.Module):
         if self._use_independent_transformer:
             _state = dict()
             for k, v in state.items():
-                if k != 't_transformer' and not k.startswith('t_weight_'):
+                if k != 't_transformer' and not k.startswith('t_weight_') and not k.startswith('t_state_weight_'):
                     _state[k] = v
             state = _state
 

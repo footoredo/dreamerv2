@@ -327,7 +327,7 @@ class WorldModel(common.Module):
             #     raise NotImplementedError
             # t_importance = tf.multiply(tf.expand_dims(source, -1), t_weight)  # [batch, length, length] -> pairwise importance
 
-            t_importance = self.calc_t_importance(post[f't_weight_{self.rssm.transformer_num_layers - 1}'], data['reward'], pred_reward, t_pred_reward, myopic_pred_reward)
+            t_importance = self.calc_t_importance(post[f't_weight_{self.rssm._transformer.num_layers - 1}'], data['reward'], pred_reward, t_pred_reward, myopic_pred_reward)
 
         if self._use_int_reward:
 
