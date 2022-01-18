@@ -605,7 +605,7 @@ class WorldModel(common.Module):
 
         if self.config.rssm.use_transformer:
             ret_dict["transformer_weights"] = dict()
-            for i in range(self.config.rssm.transformer.num_layers):
+            for i in range(self.rssm._transformer.num_layers):
                 weight_recon = states[f"t_weight_{i}"]
                 try:
                     weight_openl = prior[f"t_weight_{i}"]
@@ -613,8 +613,13 @@ class WorldModel(common.Module):
                 except KeyError:
                     weight = weight_recon
                 ret_dict["transformer_weights"][i] = weight
+                
+            if "t_state_weight_0" in states:
+                ret_dict["state_transformer_weights"] = dict()
+                for i in range(self.rssm._state_transformer.num_layers):
+                    ret_dict["state_transformer_weights"][i] = states[f"t_state_weight_{i}"]
 
-            t_importance = self.calc_t_importance(ret_dict["transformer_weights"][self.config.rssm.transformer.num_layers - 1][:, :bf], 
+            t_importance = self.calc_t_importance(ret_dict["transformer_weights"][self.rssm._transformer.num_layers - 1][:, :bf], 
                 truth_reward[:, :bf], model_reward[:, :bf], model_transformer_reward[:, :bf], model_myopic_reward[:, :bf] if model_myopic_reward is not None else None)
             ret_dict["t_importance"] = t_importance
 
