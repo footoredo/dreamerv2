@@ -65,6 +65,7 @@ defaults:
   use_independent_state_transformer: False
   use_inside_transformer: False
   inside_transformer_include_action: False
+  inside_transformer_include_importance: False
   use_independent_transformer_encoder: False
   use_transformer_reward: False
   myopic_prediction: False
