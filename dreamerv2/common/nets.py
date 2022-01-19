@@ -548,9 +548,9 @@ class EnsembleRSSM(common.Module):
                 t_importance = self._cast(tf.identity(prev_state['t_importance']))
                 # last_token = tf.stop_gradient(tf.concat([prev_stoch, prev_state['deter']], 1))
                 last_token = tf.concat([prev_stoch, prev_state['deter']], 1)
+                last_importance = tf.stop_gradient(self._importance_head(last_token).mode())
                 if self._inside_transformer_include_action:
                     last_token = tf.concat([last_token, prev_action], 1)
-                last_importance = tf.stop_gradient(self._importance_head(last_token).mode())
                 t_memory = tf.concat((t_memory, last_token[:, tf.newaxis, :]), 1)
                 t_importance = tf.concat((t_importance, last_importance[:, tf.newaxis]), 1)
                 _, indices = tf.math.top_k(t_importance, k=self._inside_memory_size)
