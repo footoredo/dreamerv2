@@ -50,6 +50,7 @@ class EnsembleRSSM(common.Module):
         self._use_independent_transformer = config.use_independent_transformer and self.use_transformer
         self._use_independent_state_transformer = config.use_independent_state_transformer and self.use_transformer
         self._use_inside_transformer = config.use_inside_transformer and self._use_independent_transformer
+        self._inside_transformer_include_action = config.inside_transformer_include_action
         self._myopic_prediction = config.myopic_prediction
         self.use_independent_transformer_encoder = config.use_independent_transformer_encoder
         self._include_transformer_embed = config.include_transformer_embed
@@ -126,7 +127,10 @@ class EnsembleRSSM(common.Module):
                         state[f't_weight_{i}'] = tf.zeros([batch_size, self._transformer.num_heads, self._memory_size])
                         # state[f't_weight_norm_{i}'] = tf.zeros([batch_size, self._transformer_num_heads])
             elif self._use_inside_transformer:
-                state['t_memory'] = tf.zeros([batch_size, self._inside_memory_size, total_stoch + self._deter])
+                token_size = total_stoch + self._deter
+                if self._inside_transformer_include_action:
+                    token_size += self._num_actions
+                state['t_memory'] = tf.zeros([batch_size, self._inside_memory_size, token_size])
                 state['t_importance'] = tf.zeros([batch_size, self._inside_memory_size])
         return state
 
@@ -544,6 +548,8 @@ class EnsembleRSSM(common.Module):
                 t_importance = self._cast(tf.identity(prev_state['t_importance']))
                 # last_token = tf.stop_gradient(tf.concat([prev_stoch, prev_state['deter']], 1))
                 last_token = tf.concat([prev_stoch, prev_state['deter']], 1)
+                if self._inside_transformer_include_action:
+                    last_token = tf.concat([last_token, prev_action], 1)
                 last_importance = tf.stop_gradient(self._importance_head(last_token).mode())
                 t_memory = tf.concat((t_memory, last_token[:, tf.newaxis, :]), 1)
                 t_importance = tf.concat((t_importance, last_importance[:, tf.newaxis]), 1)
