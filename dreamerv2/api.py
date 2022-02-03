@@ -165,6 +165,12 @@ def train(env, config, outputs=None):
         print('Pretrain agent.')
         for _ in range(config.pretrain):
             train_agent(next(dataset))
+    if config.transformer_load_dir is not None:
+        transformer_load_dir = pathlib.Path(config.transformer_load_dir) / 'transformer'
+        if transformer_load_dir.exists():
+            agnt.load_transformer(transformer_load_dir)
+        else:
+            print(f"Transformer loading dir ({transformer_load_dir}) does not exist!")
     policy = lambda *args: agnt.policy(
         *args, mode='explore' if should_expl(step) else 'train')
     print("before train", flush=True)
@@ -189,10 +195,12 @@ def train(env, config, outputs=None):
 
     if config.benchmark:
         tf.profiler.experimental.start(str(logdir))
+        
     while step < config.steps:
         print("step", step.value)
         logger.write()
         driver(policy, steps=config.eval_every)
+        agnt.save_transformer(logdir / 'transformer')
         agnt.save(logdir / 'tmp_variables.pkl')
         if config.save_episodes:
             saved_files = replay.save_episodes(logdir / "tmp_train_episodes")

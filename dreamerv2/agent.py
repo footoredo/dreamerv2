@@ -1,3 +1,4 @@
+from genericpath import exists
 import re
 
 import numpy as np
@@ -26,6 +27,13 @@ class Agent(common.Module):
             reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
             inputs = config, self.wm, self._num_act, self.step, reward
             self._expl_behavior = getattr(expl, config.expl_behavior)(*inputs)
+            
+    def save_transformer(self, save_dir):
+        save_dir.mkdir(exist_ok=True)
+        self.wm.save_transformer(save_dir)
+        
+    def load_transformer(self, load_dir):
+        self.wm.load_transformer(load_dir)
 
     @tf.function
     def policy(self, obs, state=None, mode='train'):
@@ -199,6 +207,12 @@ class WorldModel(common.Module):
         self._bootstrap_frames = config.bootstrap_frames
         self._video_pred_batches = config.video_pred_batches
         # self._running_stats = {}
+        
+    def save_transformer(self, save_dir):
+        self.rssm.save_transformer(save_dir)
+        
+    def load_transformer(self, load_dir):
+        self.rssm.load_transformer(load_dir)
 
     def train(self, data, state=None):
         print("in wm train()", flush=True)
@@ -215,7 +229,7 @@ class WorldModel(common.Module):
         print("out wm train()", flush=True)
         return state, outputs, metrics, model_loss, prior
 
-    def calc_t_importance(self, t_weight, truth_reward, pred_reward, t_pred_reward, myopic_pred_reward=None, source=None, reduction=None):
+    def calc_t_importance(self, t_weight, truth_reward, pred_reward, t_pred_reward, myopic_pred_reward, st_weight, source=None, reduction=None):
         print("in calc_t_importance")
         print("t_weight.shape", t_weight.shape)
         print("truth_reward.shape", truth_reward.shape)
@@ -228,7 +242,10 @@ class WorldModel(common.Module):
         if reduction is None:
             reduction = self.config.future_importance_reduction
 
-        t_weight = tf.identity(t_weight)  # [batch, length, num_heads, length], logits
+        if source == 'state':
+            t_weight = tf.identity(st_weight)  # [batch, length, num_heads, length], logits
+        else:
+            t_weight = tf.identity(t_weight)
         t_weight = tf.nn.softmax(t_weight, axis=-1)  # [batch, length, num_heads, length], weight
         if reduction == 'mean':
             t_weight = tf.reduce_mean(t_weight, -2)  # [batch, length, length]
@@ -248,6 +265,8 @@ class WorldModel(common.Module):
             item = tf.abs(pred_reward - t_pred_reward)
         elif source == 'reward_diff_myopic':
             item = tf.abs(myopic_pred_reward - t_pred_reward)
+        elif source == 'state':
+            item = tf.ones_like(truth_reward)
         else:
             raise NotImplementedError
 
@@ -327,7 +346,12 @@ class WorldModel(common.Module):
             #     raise NotImplementedError
             # t_importance = tf.multiply(tf.expand_dims(source, -1), t_weight)  # [batch, length, length] -> pairwise importance
 
-            t_importance = self.calc_t_importance(post[f't_weight_{self.rssm._transformer.num_layers - 1}'], data['reward'], pred_reward, t_pred_reward, myopic_pred_reward)
+            rt_weights = post[f't_weight_{self.rssm._transformer.num_layers - 1}']
+            try:
+                st_weights = post[f't_state_weight_{self.rssm._transformer.num_layers - 1}']
+            except KeyError:
+                st_weights = None
+            t_importance = self.calc_t_importance(rt_weights, data['reward'], pred_reward, t_pred_reward, myopic_pred_reward, st_weights)
 
         if self._use_int_reward:
 
@@ -620,7 +644,8 @@ class WorldModel(common.Module):
                     ret_dict["state_transformer_weights"][i] = states[f"t_state_weight_{i}"]
 
             t_importance = self.calc_t_importance(ret_dict["transformer_weights"][self.rssm._transformer.num_layers - 1][:, :bf], 
-                truth_reward[:, :bf], model_reward[:, :bf], model_transformer_reward[:, :bf], model_myopic_reward[:, :bf] if model_myopic_reward is not None else None)
+                truth_reward[:, :bf], model_reward[:, :bf], model_transformer_reward[:, :bf], model_myopic_reward[:, :bf] if model_myopic_reward is not None else None,
+                ret_dict["state_transformer_weights"][self.rssm._state_transformer.num_layers - 1][:, :bf] if "state_transformer_weights" in ret_dict else None)
             ret_dict["t_importance"] = t_importance
 
             if self.config.use_inside_transformer:

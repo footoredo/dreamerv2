@@ -73,6 +73,7 @@ defaults:
   future_importance_source: reward
   future_importance_reduction: mean
   transformer_shift: False
+  transformer_load_dir: none
   rssm: { use_transformer: False, ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1, 
           exclude_deter_feat: False, transformer: { version: 1, d_model: 1024, num_layers: 1, num_heads: 8, memory_size: 256, pe_input: 10000, dff: 1024, 
             no_pe: False, reverse_pe: False, input_dense: True },

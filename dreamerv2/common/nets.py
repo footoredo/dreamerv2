@@ -76,6 +76,22 @@ class EnsembleRSSM(common.Module):
                 self._transformer_encoder = encoder or common.Encoder(**config.encoder)
         self._importance_head = None
         self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
+        
+    def save_transformer(self, save_dir):
+        if self._transformer is not None:
+            self._transformer.save(save_dir / "transformer.pkl")
+        if self._transformer_encoder is not None:
+            self._transformer_encoder.save(save_dir / "transformer_encoder.pkl")
+        if self._importance_head is not None:
+            self._importance_head.save(save_dir / "importance_head.pkl")
+            
+    def load_transformer(self, load_dir):
+        if self._transformer is not None:
+            self._transformer.load(load_dir / "transformer.pkl")
+        if self._transformer_encoder is not None:
+            self._transformer_encoder.load(load_dir / "transformer_encoder.pkl")
+        if self._importance_head is not None:
+            self._importance_head.load(load_dir / "importance_head.pkl")
 
     def set_importance_head(self, head):
         self._importance_head = head
